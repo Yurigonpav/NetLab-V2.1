@@ -1,8 +1,14 @@
 # interface/painel_eventos.py
-# Painel do Modo Análise — três níveis de explicação (Simples, Técnico, Pacote Bruto).
-# Aba Insights reformulada: domínios DNS, ações GET/POST, hierarquia de protocolos e Top Talkers.
+# Painel do Modo Análise — três níveis de explicação + Insights com dados reais.
+#
+# OTIMIZAÇÕES v3.0:
+#   - "Dispositivos Mais Ativos" removido dos Insights
+#   - atualizar_insights() apenas armazena dados (sem re-render imediato)
+#   - Timer interno de 30 s dispara _renderizar_insights() (diff incremental)
+#   - _todos_eventos usa deque(maxlen=LIMITE_EVENTOS) → O(1) em ambas as pontas
+#   - Renderização baseada em chave de versão: evita trabalho redundante
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QScrollArea, QFrame, QPushButton, QTextEdit,
@@ -10,8 +16,9 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QGridLayout
 )
-from PyQt6.QtCore import Qt, pyqtSlot, QTimer
-from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QBrush, QPainterPath
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot
+from PyQt6.QtGui import QFont, QColor
+
 
 # ─────────────────────────────────────────────────────────────
 # Constantes visuais
@@ -29,46 +36,48 @@ ROTULOS_NIVEL = [
     ("", "Pacote Bruto", "Conteúdo exato como trafegou na rede"),
 ]
 
-# Mapeamento de domínios conhecidos para nomes amigáveis
+# Domínios conhecidos → nome amigável
 DOMINIOS_CONHECIDOS = {
-    "google.com": "Google",       "googleapis.com": "Google APIs",
-    "gstatic.com": "Google Static","youtube.com": "YouTube",
-    "youtu.be": "YouTube",         "googlevideo.com": "YouTube Vídeo",
-    "facebook.com": "Facebook",    "instagram.com": "Instagram",
-    "fbcdn.net": "Facebook CDN",   "whatsapp.com": "WhatsApp",
-    "whatsapp.net": "WhatsApp",    "twitter.com": "Twitter/X",
-    "twimg.com": "Twitter CDN",    "x.com": "X (Twitter)",
-    "netflix.com": "Netflix",      "nflxvideo.net": "Netflix Vídeo",
-    "amazon.com": "Amazon",        "amazonaws.com": "Amazon AWS",
-    "microsoft.com": "Microsoft",  "office.com": "Microsoft Office",
-    "live.com": "Microsoft Live",  "outlook.com": "Outlook",
-    "windows.com": "Windows Update","windowsupdate.com": "Windows Update",
-    "apple.com": "Apple",          "icloud.com": "iCloud",
-    "spotify.com": "Spotify",      "twitch.tv": "Twitch",
-    "tiktok.com": "TikTok",        "reddit.com": "Reddit",
-    "wikipedia.org": "Wikipedia",  "github.com": "GitHub",
-    "steamcontent.com": "Steam",   "steampowered.com": "Steam",
-    "discord.com": "Discord",      "discordapp.com": "Discord CDN",
-    "cloudflare.com": "Cloudflare","akamai.net": "Akamai CDN",
-    "akamaized.net": "Akamai CDN", "globo.com": "Globo",
-    "uol.com.br": "UOL",           "terra.com.br": "Terra",
+    "google.com": "Google",           "googleapis.com": "Google APIs",
+    "gstatic.com": "Google Static",   "youtube.com": "YouTube",
+    "youtu.be": "YouTube",            "googlevideo.com": "YouTube Vídeo",
+    "facebook.com": "Facebook",       "instagram.com": "Instagram",
+    "fbcdn.net": "Facebook CDN",      "whatsapp.com": "WhatsApp",
+    "whatsapp.net": "WhatsApp",       "twitter.com": "Twitter/X",
+    "twimg.com": "Twitter CDN",       "x.com": "X (Twitter)",
+    "netflix.com": "Netflix",         "nflxvideo.net": "Netflix Vídeo",
+    "amazon.com": "Amazon",           "amazonaws.com": "Amazon AWS",
+    "microsoft.com": "Microsoft",     "office.com": "Microsoft Office",
+    "live.com": "Microsoft Live",     "outlook.com": "Outlook",
+    "windows.com": "Windows Update",  "windowsupdate.com": "Windows Update",
+    "apple.com": "Apple",             "icloud.com": "iCloud",
+    "spotify.com": "Spotify",         "twitch.tv": "Twitch",
+    "tiktok.com": "TikTok",           "reddit.com": "Reddit",
+    "wikipedia.org": "Wikipedia",     "github.com": "GitHub",
+    "steamcontent.com": "Steam",      "steampowered.com": "Steam",
+    "discord.com": "Discord",         "discordapp.com": "Discord CDN",
+    "cloudflare.com": "Cloudflare",   "akamai.net": "Akamai CDN",
+    "akamaized.net": "Akamai CDN",    "globo.com": "Globo",
+    "uol.com.br": "UOL",              "terra.com.br": "Terra",
+    "zoom.us": "Zoom",                "teams.microsoft.com": "MS Teams",
+    "slack.com": "Slack",             "dropbox.com": "Dropbox",
+    "drive.google.com": "Google Drive",
 }
 
-# Cores por categoria de protocolo
-CORES_PROTOCOLO = {
-    "HTTP":      "#E74C3C",
-    "HTTPS":     "#2ECC71",
-    "DNS":       "#3498DB",
-    "TCP_SYN":   "#9B59B6",
-    "UDP":       "#F39C12",
-    "ICMP":      "#1ABC9C",
-    "ARP":       "#E67E22",
-    "SSH":       "#2980B9",
-    "FTP":       "#E91E63",
-    "SMB":       "#795548",
-    "RDP":       "#FF5722",
-    "DHCP":      "#16A085",
-    "Outro":     "#7f8c8d",
+# Classificação de tipo de uso por evento
+CLASSIFICACAO_USO = {
+    "DNS":              ("Navegação",          "#3498DB"),
+    "HTTP":             ("Transferência HTTP",  "#E74C3C"),
+    "HTTPS":            ("Conexão Segura",      "#2ECC71"),
+    "TCP_SYN":          ("Nova Conexão",        "#9B59B6"),
+    "ARP":              ("Descoberta Local",    "#E67E22"),
+    "ICMP":             ("Diagnóstico/Ping",    "#1ABC9C"),
+    "DHCP":             ("Config. de Rede",     "#16A085"),
+    "SSH":              ("Acesso Remoto",        "#2980B9"),
+    "FTP":              ("Transfer. Arquivo",   "#E91E63"),
+    "SMB":              ("Compartilhamento",    "#795548"),
+    "RDP":              ("Desktop Remoto",      "#FF5722"),
+    "NOVO_DISPOSITIVO": ("Novo Dispositivo",    "#F39C12"),
 }
 
 
@@ -129,7 +138,7 @@ class CartaoEvento(QFrame):
         layout.addWidget(lbl_ip)
 
         if dados.get("alerta_seguranca"):
-            badge = QLabel("Risco de segurança")
+            badge = QLabel("⚠ Risco de segurança")
             badge.setStyleSheet(
                 f"color:#E74C3C;font-size:8px;font-weight:bold;"
                 f"background:{estilo['badge']};border-radius:2px;"
@@ -146,19 +155,19 @@ class PainelContadores(QWidget):
     """Barra horizontal com contadores por tipo de evento."""
 
     TIPOS_MONITORADOS = [
-        ("DNS",    "", "#3498DB"),
-        ("HTTP",   "", "#E74C3C"),
-        ("HTTPS",  "", "#2ECC71"),
-        ("TCP_SYN","", "#9B59B6"),
-        ("ICMP",   "", "#1ABC9C"),
-        ("ARP",    "", "#E67E22"),
-        ("DHCP",   "", "#16A085"),
+        ("DNS",     "#3498DB"),
+        ("HTTP",    "#E74C3C"),
+        ("HTTPS",   "#2ECC71"),
+        ("TCP_SYN", "#9B59B6"),
+        ("ICMP",    "#1ABC9C"),
+        ("ARP",     "#E67E22"),
+        ("DHCP",    "#16A085"),
     ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._contadores: dict = defaultdict(int)
-        self._labels: dict     = {}
+        self._labels:     dict = {}
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
@@ -168,12 +177,8 @@ class PainelContadores(QWidget):
         titulo.setStyleSheet("color:#7f8c8d;font-size:9px;")
         layout.addWidget(titulo)
 
-        tipos_vistos = set()
-        for tipo, icone, cor in self.TIPOS_MONITORADOS:
-            if tipo in tipos_vistos:
-                continue
-            tipos_vistos.add(tipo)
-            lbl = QLabel(f"{icone} {tipo}: 0")
+        for tipo, cor in self.TIPOS_MONITORADOS:
+            lbl = QLabel(f"{tipo}: 0")
             lbl.setStyleSheet(
                 f"color:{cor};font-size:9px;font-family:Consolas;"
                 f"background:#0d1a2a;border:1px solid {cor}33;"
@@ -187,184 +192,17 @@ class PainelContadores(QWidget):
     def incrementar(self, tipo: str):
         self._contadores[tipo] += 1
         if tipo in self._labels:
-            icone = next(
-                (ic for t, ic, _ in self.TIPOS_MONITORADOS if t == tipo), "•"
-            )
-            self._labels[tipo].setText(
-                f"{icone} {tipo}: {self._contadores[tipo]}"
-            )
+            self._labels[tipo].setText(f"{tipo}: {self._contadores[tipo]}")
 
     def resetar(self):
         self._contadores.clear()
-        for tipo, icone, _ in self.TIPOS_MONITORADOS:
+        for tipo, _ in self.TIPOS_MONITORADOS:
             if tipo in self._labels:
-                self._labels[tipo].setText(f"{icone} {tipo}: 0")
+                self._labels[tipo].setText(f"{tipo}: 0")
 
-
-# ─────────────────────────────────────────────────────────────
-# Widget de barra de progresso personalizada
-# ─────────────────────────────────────────────────────────────
-
-class BarraProgresso(QWidget):
-    """Barra de progresso estilizada para o painel de insights."""
-
-    def __init__(self, rotulo: str, valor: float, maximo: float,
-                 cor: str = "#3498DB", sufixo: str = "", parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(28)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(8)
-
-        # Rótulo
-        lbl = QLabel(rotulo)
-        lbl.setFixedWidth(140)
-        lbl.setStyleSheet(
-            "color:#bdc3c7;font-size:10px;font-family:Consolas;"
-            "background:transparent;border:none;"
-        )
-        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(lbl)
-
-        # Barra
-        barra = QProgressBar()
-        barra.setMaximum(max(int(maximo * 10), 1))
-        barra.setValue(int(valor * 10))
-        barra.setTextVisible(False)
-        barra.setFixedHeight(10)
-        barra.setStyleSheet(f"""
-            QProgressBar {{
-                background: #0d1a2a;
-                border: 1px solid #1e2d40;
-                border-radius: 4px;
-            }}
-            QProgressBar::chunk {{
-                background: {cor};
-                border-radius: 3px;
-            }}
-        """)
-        layout.addWidget(barra, 1)
-
-        # Valor
-        percentual = (valor / maximo * 100) if maximo > 0 else 0
-        lbl_valor = QLabel(f"{percentual:.0f}% {sufixo}")
-        lbl_valor.setFixedWidth(55)
-        lbl_valor.setStyleSheet(
-            f"color:{cor};font-size:10px;font-family:Consolas;"
-            "background:transparent;border:none;"
-        )
-        layout.addWidget(lbl_valor)
-
-
-# ─────────────────────────────────────────────────────────────
-# Agregador de Insights — leve, O(1) por evento, 100% em memória
-# ─────────────────────────────────────────────────────────────
-
-from collections import Counter
-
-class _AgregadorInsights:
-    """
-    Agrega eventos de rede para Top Talkers e Top Domínios.
-    Complexidade O(1) por evento. Sem I/O. Sem banco de dados.
-    """
-
-    # Limite de entradas mantidas em memória
-    _MAX_ENTRADAS = 500
-
-    def __init__(self):
-        self.resetar()
-
-    def resetar(self):
-        self._bytes_por_ip:      Counter = Counter()
-        self._eventos_por_ip:    Counter = Counter()
-        self._contagem_dominios: Counter = Counter()
-        self._total_dns:  int = 0
-        self._versao:     int = 0
-
-    # ----------------------------------------------------------
-
-    def alimentar(self, evento: dict):
-        """
-        Processa um evento e atualiza os agregadores.
-        Nunca lança exceção — fail-safe por design.
-        """
-        try:
-            self._versao += 1
-            tipo    = evento.get("tipo", "")
-            ip      = evento.get("ip_envolvido") or evento.get("ip_origem") or ""
-            tamanho = evento.get("tamanho", 0) or 0
-
-            # ── Top Talkers ───────────────────────────────────
-            if ip:
-                self._bytes_por_ip[ip]   += tamanho
-                self._eventos_por_ip[ip] += 1
-                # Mantém só os _MAX_ENTRADAS mais ativos
-                if len(self._bytes_por_ip) > self._MAX_ENTRADAS:
-                    menor = min(self._bytes_por_ip, key=self._bytes_por_ip.__getitem__)
-                    del self._bytes_por_ip[menor]
-                    self._eventos_por_ip.pop(menor, None)
-
-            # ── Top Domínios (DNS + inferência de Host) ───────
-            if tipo == "DNS":
-                self._total_dns += 1
-                dominio = self._extrair_dominio(evento)
-                if dominio:
-                    raiz = self._dominio_raiz(dominio)
-                    self._contagem_dominios[raiz] += 1
-                    if len(self._contagem_dominios) > self._MAX_ENTRADAS:
-                        menor = min(self._contagem_dominios,
-                                    key=self._contagem_dominios.__getitem__)
-                        del self._contagem_dominios[menor]
-
-            elif tipo in ("HTTP", "HTTPS"):
-                # Infere domínio a partir do campo host ou título
-                host = (evento.get("host") or
-                        evento.get("http_host") or
-                        evento.get("dominio") or "")
-                if not host and "—" in (evento.get("titulo") or ""):
-                    host = evento["titulo"].split("—")[-1].strip()
-                if host:
-                    raiz = self._dominio_raiz(host.strip().rstrip("."))
-                    self._contagem_dominios[raiz] += 1
-
-        except Exception:
-            pass
-
-    # ----------------------------------------------------------
-
-    def top_talkers(self, n: int = 8) -> list[tuple]:
-        """Retorna lista de (ip, bytes, eventos) ordenada por bytes."""
-        return [
-            (ip, b, self._eventos_por_ip.get(ip, 0))
-            for ip, b in self._bytes_por_ip.most_common(n)
-        ]
-
-    def top_dominios(self, n: int = 10) -> list[tuple]:
-        """Retorna lista de (dominio, nome_amigavel, consultas) ordenada por frequência."""
-        return [
-            (dom, DOMINIOS_CONHECIDOS.get(dom, dom), cnt)
-            for dom, cnt in self._contagem_dominios.most_common(n)
-        ]
-
-    # ----------------------------------------------------------
-
-    @staticmethod
-    def _extrair_dominio(evento: dict) -> str:
-        dominio = evento.get("dominio", "")
-        if not dominio:
-            titulo = evento.get("titulo", "")
-            if "—" in titulo:
-                dominio = titulo.split("—")[-1].strip()
-        return dominio.strip().rstrip(".")
-
-    @staticmethod
-    def _dominio_raiz(dominio: str) -> str:
-        partes = dominio.lower().split(".")
-        if len(partes) >= 3 and partes[-2] in ("com", "org", "net", "edu", "gov"):
-            return ".".join(partes[-3:])
-        if len(partes) >= 2:
-            return ".".join(partes[-2:])
-        return dominio
+    def obter_contagens(self) -> dict:
+        """Retorna cópia dos contadores para uso nos insights."""
+        return dict(self._contadores)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -374,24 +212,45 @@ class _AgregadorInsights:
 class PainelEventos(QWidget):
     """
     Painel completo do Modo Análise com três níveis de explicação.
-    Aba Insights reformulada com análise comportamental da rede.
+    Aba Insights: Sites Acessados (DNS real) + Tipo de Uso + Alertas.
+
+    OTIMIZAÇÕES v3.0
+    ─────────────────
+    • _todos_eventos é um deque(maxlen=LIMITE_EVENTOS): O(1) nas duas pontas,
+      sem cópia de lista ao atingir o limite.
+    • atualizar_insights() apenas atualiza estado interno; o render
+      ocorre no _timer_insights interno (30 s), comparando chave de versão
+      para evitar trabalho redundante (diff incremental).
+    • "Dispositivos Mais Ativos" removido (dados de tráfego real ficam no
+      painel de Tráfego em Tempo Real).
     """
 
-    LIMITE_EVENTOS = 300
+    LIMITE_EVENTOS       = 300
+    INTERVALO_INSIGHTS_S = 30   # segundos entre re-renders dos Insights
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._todos_eventos:     list = []
-        self._eventos_filtrados: list = []
-        self._evento_atual:      dict = {}
-        self._nivel_atual:       int  = 0
-        self._filtro_protocolo:  str  = "Todos"
-        self._filtro_texto:      str  = ""
-        self._contagem_sessao:   dict = defaultdict(lambda: defaultdict(int))
+        # Buffer circular: O(1) append/pop, sem cópia ao atingir limite
+        self._todos_eventos:     deque = deque(maxlen=self.LIMITE_EVENTOS)
+        self._eventos_filtrados: list  = []
+        self._evento_atual:      dict  = {}
+        self._nivel_atual:       int   = 0
+        self._filtro_protocolo:  str   = "Todos"
+        self._filtro_texto:      str   = ""
+        self._contagem_sessao:   dict  = defaultdict(lambda: defaultdict(int))
 
-        # Agregador de insights — leve, sem estado externo
-        self._agregador                  = _AgregadorInsights()
-        self._versao_insights_renderizada: int = -1
+        # Dados externos: apenas armazenados; render é disparado pelo timer
+        self._ultimo_top_dns:      list = []
+        self._alertas_seguranca:   list = []
+
+        # Chave de versão para diff incremental
+        self._ultima_chave_render: str = ""
+
+        # ── Timer interno de insights (30 s, baixo overhead) ──────────────
+        self._timer_insights = QTimer(self)
+        self._timer_insights.setInterval(self.INTERVALO_INSIGHTS_S * 1000)
+        self._timer_insights.timeout.connect(self._renderizar_insights)
+        self._timer_insights.start()
 
         self._montar_layout()
 
@@ -408,7 +267,7 @@ class PainelEventos(QWidget):
         cab = QHBoxLayout()
         fonte_titulo = QFont("Arial", 12)
         fonte_titulo.setBold(True)
-        titulo = QLabel("  Modo Análise - Eventos de Rede em Tempo Real")
+        titulo = QLabel("  Modo Análise — Eventos de Rede em Tempo Real")
         titulo.setFont(fonte_titulo)
         cab.addWidget(titulo)
         cab.addStretch()
@@ -431,9 +290,7 @@ class PainelEventos(QWidget):
         self.abas.addTab(self._criar_aba_insights(), "Insights")
 
         self.lbl_rodape = QLabel("Nenhum evento registrado.")
-        self.lbl_rodape.setStyleSheet(
-            "color:#7f8c8d;font-size:10px;padding:2px;"
-        )
+        self.lbl_rodape.setStyleSheet("color:#7f8c8d;font-size:10px;padding:2px;")
         layout.addWidget(self.lbl_rodape)
 
         self._trocar_nivel(0)
@@ -458,9 +315,7 @@ class PainelEventos(QWidget):
             "TCP_RST", "ICMP", "ARP", "DHCP", "SSH", "FTP",
             "SMB", "RDP", "NOVO_DISPOSITIVO",
         ])
-        self.combo_protocolo.currentTextChanged.connect(
-            self._ao_mudar_filtro_protocolo
-        )
+        self.combo_protocolo.currentTextChanged.connect(self._ao_mudar_filtro_protocolo)
         row.addWidget(self.combo_protocolo)
 
         self.campo_busca = QLineEdit()
@@ -496,9 +351,7 @@ class PainelEventos(QWidget):
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._container = QWidget()
         self._layout_cartoes = QVBoxLayout(self._container)
@@ -517,9 +370,7 @@ class PainelEventos(QWidget):
         l_expl.setSpacing(4)
 
         lbl_expl = QLabel("📖  Explicação Didática")
-        lbl_expl.setStyleSheet(
-            "font-weight:bold;font-size:11px;color:#bdc3c7;"
-        )
+        lbl_expl.setStyleSheet("font-weight:bold;font-size:11px;color:#bdc3c7;")
         l_expl.addWidget(lbl_expl)
 
         row_niveis = QHBoxLayout()
@@ -552,337 +403,427 @@ class PainelEventos(QWidget):
 
         splitter.addWidget(w_expl)
         splitter.setSizes([400, 580])
-
         return widget
 
     # ──────────────────────────────────────────────
-    # Aba Insights reformulada
-    # ──────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────
-    # Aba Insights — enxuta e estável
+    # Aba Insights — dados reais
     # ──────────────────────────────────────────────
 
     def _criar_aba_insights(self) -> QWidget:
-        """
-        Aba de Insights com dois painéis:
-          1. Top Talkers — IPs com maior volume de tráfego
-          2. Top Domínios — destinos mais acessados na rede
-        """
         widget = QWidget()
         layout_externo = QVBoxLayout(widget)
         layout_externo.setContentsMargins(0, 0, 0, 0)
         layout_externo.setSpacing(0)
 
+        # Barra de resumo rápido no topo
+        self._barra_resumo = self._criar_barra_resumo()
+        layout_externo.addWidget(self._barra_resumo)
+
+        # Área rolável com os cards
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            "QScrollArea { border: none; background: transparent; }"
-        )
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
         self._container_insights = QWidget()
-        self._layout_insights = QVBoxLayout(self._container_insights)
+        self._layout_insights    = QVBoxLayout(self._container_insights)
         self._layout_insights.setContentsMargins(8, 6, 8, 8)
-        self._layout_insights.setSpacing(8)
+        self._layout_insights.setSpacing(10)
         self._layout_insights.addStretch()
 
         scroll.setWidget(self._container_insights)
         layout_externo.addWidget(scroll)
 
-        # Rodapé
-        frame_rodape = QFrame()
-        frame_rodape.setFixedHeight(28)
-        frame_rodape.setStyleSheet(
-            "QFrame { background:#0a0f1a; border-top:1px solid #1e2d40; }"
-        )
-        layout_rodape = QHBoxLayout(frame_rodape)
-        layout_rodape.setContentsMargins(8, 4, 8, 4)
-
-        self._lbl_resumo_insights = QLabel("Aguardando dados de captura...")
-        self._lbl_resumo_insights.setStyleSheet(
-            "color:#7f8c8d;font-size:9px;border:none;"
-        )
-        layout_rodape.addWidget(self._lbl_resumo_insights)
-        layout_rodape.addStretch()
-
-        self._lbl_total_insights = QLabel("")
-        self._lbl_total_insights.setStyleSheet(
-            "color:#3498DB;font-size:9px;font-family:Consolas;border:none;"
-        )
-        layout_rodape.addWidget(self._lbl_total_insights)
-
-        layout_externo.addWidget(frame_rodape)
         return widget
 
+    def _criar_barra_resumo(self) -> QFrame:
+        """Faixa de métricas rápidas no topo da aba Insights."""
+        frame = QFrame()
+        frame.setFixedHeight(44)
+        frame.setStyleSheet(
+            "QFrame { background:#0a0f1a; border-bottom:1px solid #1e2d40; }"
+            "QLabel { border:none; background:transparent; }"
+        )
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setSpacing(0)
+
+        def _metrica(rotulo: str, cor: str) -> QLabel:
+            lbl = QLabel(rotulo)
+            lbl.setStyleSheet(
+                f"color:{cor};font-size:10px;font-family:Consolas;"
+                "padding: 0 14px 0 0;border:none;background:transparent;"
+            )
+            return lbl
+
+        lbl_label = QLabel("  Sessão atual:  ")
+        lbl_label.setStyleSheet(
+            "color:#566573;font-size:10px;border:none;background:transparent;"
+        )
+
+        self._lbl_resumo_eventos = _metrica("0 eventos",        "#3498DB")
+        self._lbl_resumo_dns     = _metrica("0 consultas DNS",  "#2ECC71")
+        self._lbl_resumo_volume  = _metrica("0 B trafegados",   "#9B59B6")
+        self._lbl_resumo_alertas = _metrica("0 alertas",        "#566573")
+
+        layout.addWidget(lbl_label)
+        layout.addWidget(self._lbl_resumo_eventos)
+        layout.addWidget(self._lbl_resumo_dns)
+        layout.addWidget(self._lbl_resumo_volume)
+        layout.addWidget(self._lbl_resumo_alertas)
+        layout.addStretch()
+
+        return frame
+
     # ──────────────────────────────────────────────
-    # Renderização dos cards de Insights
+    # Renderização dos Insights (diff incremental)
     # ──────────────────────────────────────────────
 
+    @pyqtSlot()
     def _renderizar_insights(self):
         """
-        Reconstrói os dois cards de insights quando há novos dados.
-        Todos os widgets são criados frescos — sem risco de objeto C++ deletado.
-        """
-        versao_atual = self._agregador._versao
-        if versao_atual == self._versao_insights_renderizada:
-            return
-        self._versao_insights_renderizada = versao_atual
+        Reconstrói os cards de insights usando dados reais.
+        Disparado pelo _timer_insights (30 s) ou ao limpar a sessão.
 
-        # Limpa layout de forma segura (sem guardar referência de placeholder)
+        DIFF INCREMENTAL: calcula uma chave de versão antes de fazer
+        qualquer trabalho de UI; abandona se os dados não mudaram.
+        """
+        n_eventos = len(self._todos_eventos)
+        n_dns     = len(self._ultimo_top_dns)
+        n_alertas = len(self._alertas_seguranca)
+        chave     = f"{n_eventos}:{n_dns}:{n_alertas}"
+        if chave == self._ultima_chave_render:
+            return   # nada mudou — sem re-render
+        self._ultima_chave_render = chave
+
+        # Remove widgets antigos de forma segura
         while self._layout_insights.count() > 0:
             item = self._layout_insights.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
-        total_ev = len(self._todos_eventos)
-
-        if total_ev == 0:
+        # Estado vazio
+        if n_eventos == 0:
             lbl = QLabel(
                 "Os insights aparecerão aqui durante a captura.\n\n"
                 "Inicie a captura e navegue pela internet para\n"
-                "ver os dados de tráfego em tempo real."
+                "ver análise completa do tráfego em tempo real."
             )
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("color:#4a5a6b;font-size:12px;padding:50px;")
             self._layout_insights.addWidget(lbl)
             self._layout_insights.addStretch()
-            self._lbl_resumo_insights.setText("Aguardando dados de captura...")
-            self._lbl_total_insights.setText("")
+            self._atualizar_barra_resumo(0, 0, 0, 0)
             return
 
-        talkers  = self._agregador.top_talkers(8)
-        dominios = self._agregador.top_dominios(10)
-
-        self._layout_insights.addWidget(self._card_talkers(talkers, total_ev))
-        self._layout_insights.addWidget(self._card_dominios(dominios))
+        # Monta os cards — Sites Acessados + Tipo de Uso + Alertas
+        self._layout_insights.addWidget(
+            self._card_sites_acessados(self._ultimo_top_dns)
+        )
+        self._layout_insights.addWidget(
+            self._card_tipo_uso()
+        )
+        if self._alertas_seguranca:
+            self._layout_insights.addWidget(
+                self._card_alertas()
+            )
         self._layout_insights.addStretch()
 
-        n_dns = self._agregador._total_dns
-        self._lbl_resumo_insights.setText(
-            f"{total_ev} eventos · {n_dns} consultas DNS"
+        # Atualiza barra de resumo
+        total_consultas_dns = sum(d.get("acessos", 0) for d in self._ultimo_top_dns)
+        self._atualizar_barra_resumo(
+            n_eventos,
+            total_consultas_dns,
+            0,          # volume total não é mais exibido neste painel
+            n_alertas,
         )
-        self._lbl_total_insights.setText(f"{total_ev:,} eventos analisados")
+
+    def _atualizar_barra_resumo(self, eventos: int, consultas_dns: int,
+                                volume_bytes: int, alertas: int):
+        """Atualiza apenas os labels da faixa superior de métricas."""
+        self._lbl_resumo_eventos.setText(f"{eventos:,} eventos")
+        self._lbl_resumo_dns.setText(f"{consultas_dns:,} consultas DNS")
+        self._lbl_resumo_volume.setText(f"{self._formatar_bytes(volume_bytes)} trafegados")
+        cor_alerta = "#E74C3C" if alertas > 0 else "#566573"
+        self._lbl_resumo_alertas.setStyleSheet(
+            f"color:{cor_alerta};font-size:10px;font-family:Consolas;padding:0 14px 0 0;"
+        )
+        self._lbl_resumo_alertas.setText(
+            f"{'⚠ ' if alertas > 0 else ''}{alertas} alerta(s)"
+        )
 
     # ──────────────────────────────────────────────
-    # Card 1 — Top Talkers
+    # Card — Sites Acessados (DNS real)
     # ──────────────────────────────────────────────
 
-    def _card_talkers(self, talkers: list, total_ev: int) -> QFrame:
-        """Card com os IPs de maior movimentação de rede."""
-        frame = QFrame()
-        frame.setStyleSheet(
-            "QFrame { background:#0d1a2a; border:1px solid #2a1a3a; border-radius:8px; }"
-            "QLabel { border:none; background:transparent; }"
-        )
+    def _card_sites_acessados(self, top_dns: list) -> QFrame:
+        """Usa top_dns vindo de analisador_pacotes.obter_top_dns()."""
+        frame = self._criar_frame_card("#1a3a5f", "#2a5a70")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
-        # Cabeçalho
         cab = QHBoxLayout()
-        titulo = QLabel("  Top Talkers — Maior Volume de Tráfego")
-        titulo.setStyleSheet(
-            "color:#9B59B6;font-weight:bold;font-size:11px;padding-bottom:4px;"
-        )
+        titulo = QLabel("  Sites Mais Acessados")
+        titulo.setStyleSheet("color:#2ECC71;font-weight:bold;font-size:11px;")
         cab.addWidget(titulo)
         cab.addStretch()
-        lbl_n = QLabel(f"{len(talkers)} IP(s) ativos · {total_ev} eventos totais")
-        lbl_n.setStyleSheet("color:#4a3a6a;font-size:9px;")
-        cab.addWidget(lbl_n)
+        total_consultas = sum(d.get("acessos", 0) for d in top_dns)
+        cab.addWidget(self._lbl_info(
+            f"{len(top_dns)} domínio(s) · {total_consultas} consultas DNS"
+        ))
         layout.addLayout(cab)
 
-        sub = QLabel("IPs com maior movimentação de dados nesta sessão")
-        sub.setStyleSheet("color:#6a4a8a;font-size:9px;")
+        sub = QLabel("Baseado em consultas DNS reais capturadas na rede")
+        sub.setStyleSheet("color:#4a6a8a;font-size:9px;")
         layout.addWidget(sub)
 
-        if not talkers:
-            lbl_v = QLabel("Nenhum dado de tráfego disponível ainda.")
-            lbl_v.setStyleSheet("color:#4a5a6b;font-size:10px;padding:10px;")
-            lbl_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(lbl_v)
+        if not top_dns:
+            layout.addWidget(self._lbl_vazio("Nenhum domínio DNS capturado ainda."))
             return frame
 
-        # Tabela
-        n_rows = len(talkers)
-        tabela = QTableWidget(n_rows, 3)
-        tabela.setHorizontalHeaderLabels(["IP / Endereço", "Volume", "Eventos"])
-        tabela.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        tabela.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
-        tabela.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
-        )
-        tabela.verticalHeader().setVisible(False)
-        tabela.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        tabela.setAlternatingRowColors(True)
-        tabela.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        tabela.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        tabela.setStyleSheet("""
-            QTableWidget {
-                background:#0d1a2a; color:#ecf0f1;
-                border:none; gridline-color:#1e2d40; font-size:10px;
-            }
-            QTableWidget::item:alternate { background:#0a1520; }
-            QHeaderView::section {
-                background:#0a1520; color:#7f8c8d;
-                border:1px solid #1e2d40; padding:4px; font-size:9px;
-            }
-        """)
+        max_acessos = max((d.get("acessos", 1) for d in top_dns[:15]), default=1)
 
-        for i, (ip, bytes_, eventos) in enumerate(talkers):
-            ip_item = QTableWidgetItem(ip)
-            ip_item.setForeground(QColor("#9B59B6"))
-            tabela.setItem(i, 0, ip_item)
+        for i, dom in enumerate(top_dns[:15]):
+            dominio  = dom.get("dominio", "?")
+            acessos  = dom.get("acessos", 0)
+            bytes_d  = dom.get("bytes",   0)
 
-            vol_item = QTableWidgetItem(self._formatar_bytes(bytes_))
-            vol_item.setForeground(QColor("#2ECC71"))
-            vol_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            tabela.setItem(i, 1, vol_item)
+            # Nome amigável por sufixo de domínio
+            nome = dominio
+            for sufixo, apelido in DOMINIOS_CONHECIDOS.items():
+                if dominio == sufixo or dominio.endswith("." + sufixo):
+                    nome = apelido
+                    break
 
-            evt_item = QTableWidgetItem(str(eventos))
-            evt_item.setForeground(QColor("#3498DB"))
-            evt_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            tabela.setItem(i, 2, evt_item)
+            row = QHBoxLayout()
+            row.setSpacing(6)
 
-        tabela.setFixedHeight(n_rows * 26 + 30)
-        layout.addWidget(tabela)
-        return frame
+            lbl_num = QLabel(f"{i + 1}.")
+            lbl_num.setFixedWidth(20)
+            lbl_num.setStyleSheet("color:#566573;font-size:9px;")
 
-    # ──────────────────────────────────────────────
-    # Card 2 — Top Domínios / Serviços
-    # ──────────────────────────────────────────────
-
-    def _card_dominios(self, dominios: list) -> QFrame:
-        """Card com ranking dos domínios/serviços mais acessados."""
-        frame = QFrame()
-        frame.setStyleSheet(
-            "QFrame { background:#0d1a2a; border:1px solid #1e4a6b; border-radius:8px; }"
-            "QLabel { border:none; background:transparent; }"
-        )
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
-
-        # Cabeçalho
-        cab = QHBoxLayout()
-        titulo = QLabel("  Top Domínios / Serviços")
-        titulo.setStyleSheet(
-            "color:#3498DB;font-weight:bold;font-size:11px;padding-bottom:4px;"
-        )
-        cab.addWidget(titulo)
-        cab.addStretch()
-        lbl_n = QLabel(f"{len(dominios)} domínio(s) único(s)")
-        lbl_n.setStyleSheet("color:#2a4a6a;font-size:9px;")
-        cab.addWidget(lbl_n)
-        layout.addLayout(cab)
-
-        n_dns = self._agregador._total_dns
-        sub = QLabel(
-            f"Baseado em {n_dns} consultas DNS · "
-            "inclui inferência via HTTP/HTTPS Host"
-        )
-        sub.setStyleSheet("color:#6a8aaa;font-size:9px;")
-        layout.addWidget(sub)
-
-        if not dominios:
-            if n_dns > 0:
-                msg = (f"{n_dns} consulta(s) capturada(s), "
-                       "mas domínios não foram identificados.")
-            else:
-                msg = "Nenhum domínio capturado ainda."
-            lbl_v = QLabel(msg)
-            lbl_v.setStyleSheet("color:#4a5a6b;font-size:10px;padding:10px;")
-            lbl_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl_v.setWordWrap(True)
-            layout.addWidget(lbl_v)
-            return frame
-
-        maximo = dominios[0][2] if dominios else 1
-
-        for i, (dom, nome, cnt) in enumerate(dominios[:10]):
-            pct = cnt / maximo * 100
-
-            linha = QHBoxLayout()
-            linha.setSpacing(6)
-
-            lbl_rank = QLabel(f"{i + 1}.")
-            lbl_rank.setFixedWidth(18)
-            lbl_rank.setStyleSheet("color:#4a6a8a;font-size:9px;")
-            linha.addWidget(lbl_rank)
-
-            lbl_nome = QLabel(nome if nome != dom else dom)
-            lbl_nome.setFixedWidth(130)
-            lbl_nome.setStyleSheet(
-                "color:#ecf0f1;font-size:10px;font-family:Consolas;"
-            )
-            lbl_nome.setToolTip(dom)
-            linha.addWidget(lbl_nome)
+            lbl_dom = QLabel(dominio)
+            lbl_dom.setFixedWidth(180)
+            lbl_dom.setToolTip(nome)
+            lbl_dom.setStyleSheet("color:#ecf0f1;font-size:9px;font-family:Consolas;")
 
             barra = QProgressBar()
-            barra.setMaximum(100)
-            barra.setValue(int(pct))
+            barra.setRange(0, max(max_acessos, 1))
+            barra.setValue(acessos)
+            barra.setFixedHeight(12)
             barra.setTextVisible(False)
-            barra.setFixedHeight(8)
             barra.setStyleSheet("""
-                QProgressBar { background:#0a1520; border:none; border-radius:3px; }
-                QProgressBar::chunk { background:#3498DB; border-radius:3px; }
+                QProgressBar { background:#0d1520; border-radius:3px; }
+                QProgressBar::chunk { background:#2ECC71; border-radius:3px; }
             """)
-            linha.addWidget(barra, 1)
 
-            lbl_cnt = QLabel(f"{cnt}×")
+            lbl_cnt = QLabel(f"{acessos}x")
             lbl_cnt.setFixedWidth(36)
-            lbl_cnt.setStyleSheet(
-                "color:#3498DB;font-size:10px;font-family:Consolas;"
-            )
-            lbl_cnt.setAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            linha.addWidget(lbl_cnt)
+            lbl_cnt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl_cnt.setStyleSheet("color:#2ECC71;font-size:9px;font-family:Consolas;")
 
-            row_w = QWidget()
-            row_w.setLayout(linha)
-            layout.addWidget(row_w)
+            lbl_vol = QLabel(self._formatar_bytes(bytes_d))
+            lbl_vol.setFixedWidth(52)
+            lbl_vol.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl_vol.setStyleSheet("color:#9B59B6;font-size:8px;font-family:Consolas;")
+
+            row.addWidget(lbl_num)
+            row.addWidget(lbl_dom)
+            row.addWidget(barra, 1)
+            row.addWidget(lbl_cnt)
+            row.addWidget(lbl_vol)
+            layout.addLayout(row)
 
         return frame
 
     # ──────────────────────────────────────────────
-    # Utilitário
+    # Card — Tipo de Uso
+    # ──────────────────────────────────────────────
+
+    def _card_tipo_uso(self) -> QFrame:
+        frame = self._criar_frame_card("#1a2a1f", "#2a4030")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        cab = QHBoxLayout()
+        titulo = QLabel("  Classificação de Uso da Rede")
+        titulo.setStyleSheet("color:#F39C12;font-weight:bold;font-size:11px;")
+        cab.addWidget(titulo)
+        cab.addStretch()
+        layout.addLayout(cab)
+
+        contagens = self.painel_contadores.obter_contagens()
+        total_eventos = sum(contagens.values()) or 1
+
+        if not contagens:
+            layout.addWidget(self._lbl_vazio("Nenhum evento classificado ainda."))
+            return frame
+
+        # Agrupa por categoria
+        categorias: dict = defaultdict(int)
+        for tipo, qtd in contagens.items():
+            cat, _ = CLASSIFICACAO_USO.get(tipo, ("Outro", "#7f8c8d"))
+            categorias[cat] += qtd
+
+        sorted_cats = sorted(categorias.items(), key=lambda x: x[1], reverse=True)
+        max_qtd = sorted_cats[0][1] if sorted_cats else 1
+
+        grid = QGridLayout()
+        grid.setSpacing(6)
+
+        for idx, (cat, qtd) in enumerate(sorted_cats[:8]):
+            tipo_orig = next(
+                (t for t, (c, _) in CLASSIFICACAO_USO.items() if c == cat), ""
+            )
+            _, cor = CLASSIFICACAO_USO.get(tipo_orig, ("", "#7f8c8d"))
+            pct = (qtd / total_eventos) * 100
+
+            lbl_cat = QLabel(cat)
+            lbl_cat.setStyleSheet(f"color:{cor};font-size:9px;font-weight:bold;")
+
+            barra = QProgressBar()
+            barra.setRange(0, max(max_qtd, 1))
+            barra.setValue(qtd)
+            barra.setFixedHeight(10)
+            barra.setTextVisible(False)
+            barra.setStyleSheet(f"""
+                QProgressBar {{ background:#0d1520; border-radius:3px; }}
+                QProgressBar::chunk {{ background:{cor}; border-radius:3px; }}
+            """)
+
+            lbl_pct = QLabel(f"{pct:.0f}%")
+            lbl_pct.setFixedWidth(36)
+            lbl_pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl_pct.setStyleSheet(f"color:{cor};font-size:9px;font-family:Consolas;")
+
+            grid.addWidget(lbl_cat,  idx, 0)
+            grid.addWidget(barra,    idx, 1)
+            grid.addWidget(lbl_pct,  idx, 2)
+
+        layout.addLayout(grid)
+        return frame
+
+    # ──────────────────────────────────────────────
+    # Card — Alertas de Segurança
+    # ──────────────────────────────────────────────
+
+    def _card_alertas(self) -> QFrame:
+        frame = self._criar_frame_card("#2a0a00", "#400f00")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+
+        cab = QHBoxLayout()
+        titulo = QLabel(f"⚠  Alertas de Segurança ({len(self._alertas_seguranca)})")
+        titulo.setStyleSheet("color:#E74C3C;font-weight:bold;font-size:11px;")
+        cab.addWidget(titulo)
+        cab.addStretch()
+        layout.addLayout(cab)
+
+        for alerta in self._alertas_seguranca[-10:]:
+            lbl = QLabel(alerta[:120])
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#e88080;font-size:9px;font-family:Consolas;")
+            layout.addWidget(lbl)
+
+        return frame
+
+    # ──────────────────────────────────────────────
+    # Auxiliares visuais (widgets e formatação)
     # ──────────────────────────────────────────────
 
     @staticmethod
-    def _formatar_bytes(b: int) -> str:
-        """Formata bytes para exibição legível."""
-        if b == 0:
-            return "—"
-        kb = b / 1024
-        if kb < 1024:
-            return f"{kb:.1f} KB"
-        return f"{kb / 1024:.2f} MB"
+    def _criar_frame_card(cor_fundo: str, cor_borda: str) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {cor_fundo};
+                border: 1px solid {cor_borda};
+                border-radius: 8px;
+            }}
+        """)
+        return frame
+
+    @staticmethod
+    def _lbl_info(texto: str) -> QLabel:
+        lbl = QLabel(texto)
+        lbl.setStyleSheet("color:#566573;font-size:9px;font-family:Consolas;")
+        return lbl
+
+    @staticmethod
+    def _lbl_vazio(texto: str) -> QLabel:
+        lbl = QLabel(texto)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet("color:#4a5a6b;font-size:10px;padding:20px;")
+        return lbl
+
+    @staticmethod
+    def _criar_tabela(colunas: list, n_linhas: int) -> QTableWidget:
+        t = QTableWidget(n_linhas, len(colunas))
+        t.setHorizontalHeaderLabels(colunas)
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.verticalHeader().setVisible(False)
+        t.setAlternatingRowColors(True)
+        t.setStyleSheet("""
+            QTableWidget {
+                background:#0a0f1a; color:#ecf0f1;
+                gridline-color:#1e2d40; border:none;
+                alternate-background-color:#0d1520;
+                font-size:9px; font-family:Consolas;
+            }
+            QHeaderView::section {
+                background:#0d1520; color:#7f8c8d;
+                border:none; padding:4px; font-size:9px;
+            }
+        """)
+        t.horizontalHeader().setStretchLastSection(True)
+        return t
+
+    @staticmethod
+    def _formatar_bytes(n: int) -> str:
+        if n >= 1_073_741_824:
+            return f"{n / 1_073_741_824:.2f} GB"
+        if n >= 1_048_576:
+            return f"{n / 1_048_576:.1f} MB"
+        if n >= 1_024:
+            return f"{n / 1_024:.1f} KB"
+        return f"{n} B"
+
+    @staticmethod
+    def _eh_ip_local(ip: str) -> bool:
+        try:
+            partes = [int(p) for p in ip.split(".")]
+            if len(partes) != 4:
+                return False
+            if partes[0] == 10:
+                return True
+            if partes[0] == 172 and 16 <= partes[1] <= 31:
+                return True
+            if partes[0] == 192 and partes[1] == 168:
+                return True
+        except Exception:
+            pass
+        return False
 
     # ──────────────────────────────────────────────
-    # Métodos públicos de atualização (compatíveis com janela_principal)
+    # API pública — chamada pela janela principal
     # ──────────────────────────────────────────────
 
-    def atualizar_insights(self, top_dns: list, historias: list):
+    def atualizar_insights(self, top_dns: list, historias: list,
+                           top_dispositivos: list = None):
         """
-        Chamado a cada segundo pela janela principal.
-        Apenas dispara a re-renderização se houver novos dados.
+        Chamado periodicamente pela janela principal com dados do analisador.
+        APENAS armazena os dados; o render ocorre no _timer_insights (30 s).
+        Isso desacopla coleta de dados de renderização e evita re-renders
+        desnecessários a cada segundo.
         """
-        self._renderizar_insights()
-
-    def atualizar_insights_correlacionados(self, insights: list, estatisticas: dict,
-                                            top_dominios: list, narrativas: list):
-        """Compatibilidade com MotorCorrelacao externo."""
-        self._renderizar_insights()
+        if top_dns:
+            self._ultimo_top_dns = top_dns
+        # top_dispositivos ignorado — card removido nesta versão
 
     def adicionar_evento(self, dados: dict):
         """Recebe um evento do motor pedagógico e exibe na interface."""
@@ -896,9 +837,7 @@ class PainelEventos(QWidget):
                     continue
             return txt
 
-        if len(self._todos_eventos) >= self.LIMITE_EVENTOS:
-            self._todos_eventos.pop(0)
-
+        # deque(maxlen) descarta automaticamente o mais antigo — sem pop(0)
         sessao = dados.get("sessao_id", "sessao_default")
         tipo   = dados.get("tipo", "")
         self._contagem_sessao[sessao][tipo] += 1
@@ -912,6 +851,15 @@ class PainelEventos(QWidget):
         self._todos_eventos.append(dados)
         self.painel_contadores.incrementar(tipo)
 
+        # Coleta alertas de segurança (cap. 50 para não inflar a deque)
+        alerta = dados.get("alerta_seguranca", "")
+        if alerta and len(self._alertas_seguranca) < 50:
+            ts    = dados.get("timestamp", "")
+            ip    = dados.get("ip_envolvido", "")
+            texto = f"[{ts}] {ip} — {alerta[:100]}"
+            if texto not in self._alertas_seguranca:
+                self._alertas_seguranca.append(texto)
+
         if self._passa_filtro(dados):
             self._adicionar_cartao(dados)
             self._eventos_filtrados.append(dados)
@@ -920,44 +868,33 @@ class PainelEventos(QWidget):
         self._renderizar_explicacao()
         self._atualizar_rodape()
 
-        # Alimenta o agregador de insights
-        try:
-            self._agregador.alimentar(dados)
-        except Exception:
-            pass
-
     def limpar(self):
         """Limpa todos os eventos e reinicia a interface."""
         self._todos_eventos.clear()
         self._eventos_filtrados.clear()
         self._evento_atual = {}
         self._contagem_sessao.clear()
+        self._alertas_seguranca.clear()
+        self._ultimo_top_dns.clear()
+        self._ultima_chave_render = ""
         self.painel_contadores.resetar()
 
+        # Remove cartões
         while self._layout_cartoes.count() > 1:
             item = self._layout_cartoes.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        # Limpa aba de insights
+        # Limpa insights
         while self._layout_insights.count() > 0:
             item = self._layout_insights.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        self._layout_insights.addWidget(self._lbl_insights_vazio)
         self._layout_insights.addStretch()
-        self._lbl_resumo_insights.setText("Aguardando dados de captura...")
-        self._lbl_total_insights.setText("")
 
         self.lbl_rodape.setText("Nenhum evento registrado.")
         self._exibir_boas_vindas()
-
-        # Reseta agregador
-        try:
-            self._agregador.resetar()
-            self._versao_insights_renderizada = -1
-        except Exception:
-            pass
+        self._atualizar_barra_resumo(0, 0, 0, 0)
 
     # ──────────────────────────────────────────────
     # Filtros
@@ -974,7 +911,6 @@ class PainelEventos(QWidget):
         self._reaplicar_filtros()
 
     def _passa_filtro(self, dados: dict) -> bool:
-        """Verifica se um evento passa pelos filtros ativos."""
         if (self._filtro_protocolo and
                 self._filtro_protocolo != "Todos" and
                 dados.get("tipo", "").upper() != self._filtro_protocolo.upper()):
@@ -992,7 +928,6 @@ class PainelEventos(QWidget):
         return True
 
     def _reaplicar_filtros(self):
-        """Reconstrói a lista de cartões com os filtros ativos."""
         while self._layout_cartoes.count() > 1:
             item = self._layout_cartoes.takeAt(0)
             if item.widget():
@@ -1013,11 +948,11 @@ class PainelEventos(QWidget):
             self._exibir_boas_vindas()
 
     def _atualizar_rodape(self):
-        """Atualiza o texto do rodapé com contagens da sessão."""
         total    = len(self._todos_eventos)
         visiveis = len(self._eventos_filtrados)
-        sessao   = self._evento_atual.get("sessao_id", "sessao_default") if self._evento_atual else None
-        extra    = ""
+        sessao   = (self._evento_atual.get("sessao_id", "sessao_default")
+                    if self._evento_atual else None)
+        extra = ""
         if sessao and sessao in self._contagem_sessao:
             resumo = ", ".join(
                 f"{k}:{v}"
@@ -1037,7 +972,6 @@ class PainelEventos(QWidget):
     # ──────────────────────────────────────────────
 
     def _adicionar_cartao(self, dados: dict):
-        """Insere um cartão de evento na lista lateral."""
         cartao = CartaoEvento(dados)
         dados_ref = dados
         cartao.mousePressEvent = lambda _: self._ao_clicar_cartao(dados_ref)
@@ -1053,7 +987,6 @@ class PainelEventos(QWidget):
         self._renderizar_explicacao()
 
     def _trocar_nivel(self, nivel: int):
-        """Troca o nível de explicação exibido (Simples / Técnico / Pacote Bruto)."""
         self._nivel_atual = nivel
         for i, btn in enumerate(self.botoes_nivel):
             btn.setChecked(i == nivel)
@@ -1061,7 +994,6 @@ class PainelEventos(QWidget):
             self._renderizar_explicacao()
 
     def _renderizar_explicacao(self):
-        """Constrói o HTML da explicação para o evento atual no nível selecionado."""
         if not self._evento_atual or not self._evento_atual.get("titulo"):
             return
 
@@ -1089,7 +1021,7 @@ class PainelEventos(QWidget):
                     "<div style='text-align:center;padding:40px;color:#7f8c8d;'>"
                     "<b>Pacote Bruto</b> está disponível apenas para eventos HTTP.<br><br>"
                     "Acesse um site HTTP (porta 80) e envie um formulário para "
-                    "visualizar o conteúdo exato do pacote como trafegou na rede."
+                    "visualizar o conteúdo exato do pacote."
                     "</div>"
                 )
         else:
@@ -1114,7 +1046,7 @@ class PainelEventos(QWidget):
             bloco_alerta = (
                 f"<div style='background:#2a0a00;border:1px solid #E74C3C;"
                 f"border-radius:5px;padding:10px 14px;margin:8px 0;'>"
-                f"<b style='color:#E74C3C;'>ALERTA DE SEGURANÇA:</b><br>"
+                f"<b style='color:#E74C3C;'>⚠ ALERTA DE SEGURANÇA:</b><br>"
                 f"<span style='color:#ecf0f1;'>{alerta}</span>"
                 f"</div>"
             )
@@ -1143,7 +1075,6 @@ class PainelEventos(QWidget):
         self.texto_explicacao.setHtml(html)
 
     def _exibir_boas_vindas(self):
-        """Exibe mensagem inicial de boas-vindas no painel de explicação."""
         self.texto_explicacao.setHtml("""
         <div style="font-family:Arial,sans-serif;font-size:11px;
                     line-height:1.7;color:#ecf0f1;padding:4px;">
@@ -1162,12 +1093,11 @@ class PainelEventos(QWidget):
           <p><b>Os três níveis de explicação:</b><br>
           <b>Simples</b> — linguagem do dia a dia, sem jargão técnico<br>
           <b>Técnico</b> — protocolos, portas, vulnerabilidades<br>
-          <b>Pacote Bruto</b> — conteúdo exato como trafegou na rede
-          (exclusivo para HTTP), com destaques de campos e riscos</p>
+          <b>Pacote Bruto</b> — conteúdo exato transmitido na rede
+          (exclusivo para HTTP)</p>
           <p style="color:#7f8c8d;font-size:10px;">
-            Acesse a aba <b>Insights</b> para ver análise comportamental da rede:
-            sites mais acessados, ações detectadas, hierarquia de protocolos
-            e os dispositivos com maior volume de tráfego (Top Talkers).
+            Acesse a aba <b>Insights</b> para ver quais sites foram
+            acessados e o tipo de uso da rede (atualizado a cada 30 s).
           </p>
         </div>
         """)
