@@ -3,6 +3,8 @@
 # O nível Pacote Bruto é exclusivo para HTTP e mostra o tráfego exatamente como capturado.
 # Aba de Insights refatorada para usar dados do MotorCorrelacao.
 
+import sys
+import os
 from collections import defaultdict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -12,6 +14,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
+
+# Importar AnalisadorInsights
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from analisador_insights import AnalisadorInsights
+except ImportError:
+    AnalisadorInsights = None
 
 ESTILOS_NIVEL = {
     "INFO":   {"borda": "#3498DB", "fundo": "#0d1a2a", "badge": "#1a4a6b"},
@@ -419,6 +428,9 @@ class PainelEventos(QWidget):
         # Motor de insights local — agrega dados de eventos sem estado externo
         self._insights_local            = _MotorInsightsLocal()
         self._insights_versao_renderizada: int = -1
+        # Analisador 100% em memória — detecção de ações e alertas críticos
+        self._analisador_insights = AnalisadorInsights() if AnalisadorInsights else None
+        self._analisador_versao_renderizada: int = -1
         self._montar_layout()
 
     # ──────────────────────────────────────────────
@@ -890,6 +902,13 @@ class PainelEventos(QWidget):
         except Exception:
             pass
 
+        # Hook analisador insights — detecção de ações e alertas
+        if self._analisador_insights:
+            try:
+                self._analisador_insights.processar_evento(dados)
+            except Exception:
+                pass
+
     def limpar(self):
         self._todos_eventos.clear()
         self._eventos_filtrados.clear()
@@ -921,6 +940,14 @@ class PainelEventos(QWidget):
             self._insights_versao_renderizada = -1
         except Exception:
             pass
+
+        # Reseta analisador de insights
+        if self._analisador_insights:
+            try:
+                self._analisador_insights.limpar_dados()
+                self._analisador_versao_renderizada = -1
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────
     # Filtros

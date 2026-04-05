@@ -659,7 +659,7 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
     <div class="badge">{badge}</div>
     <ul>{extra}</ul>
     <form method="POST" action="/login">
-      <input type="text" name="usuario" placeholder="Usuário" value="admin" required>
+      <input type="text" name="usuario" placeholder="Usuário" required>
       <input type="password" name="senha" placeholder="Senha (numérica)">
       {captcha_input}
       <button type="submit">Entrar</button>
