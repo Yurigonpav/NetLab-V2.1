@@ -266,6 +266,32 @@ def _parsear_pacote(dados: dict):
             evento, protocolo_efetivo = _parse_http(
                 dados.get("payload", b""), ip_origem, ip_destino
             )
+            # --- ENRIQUECIMENTO PARA O MOTOR PEDAGÓGICO ---
+            if evento and evento.get("tipo") == "HTTP":
+                payload_bruto = dados.get("payload", b"")
+                if payload_bruto:
+                    try:
+                        payload_texto = payload_bruto.decode('utf-8', errors='ignore')
+                        # Separa cabeçalho e corpo
+                        if '\r\n\r\n' in payload_texto:
+                            cabecalho, corpo = payload_texto.split('\r\n\r\n', 1)
+                            linhas_cabecalho = cabecalho.split('\r\n')
+                            # Extrai headers
+                            headers = {}
+                            for linha in linhas_cabecalho[1:]:
+                                if ': ' in linha:
+                                    chave, valor = linha.split(': ', 1)
+                                    headers[chave] = valor
+                            evento["http_headers"] = headers
+                            evento["http_corpo"] = corpo
+                            # Garante método e caminho já existentes
+                            if "metodo" in evento:
+                                evento["http_metodo"] = evento["metodo"]
+                            if "recurso" in evento:
+                                evento["http_caminho"] = evento["recurso"]
+                    except Exception:
+                        pass
+            # -------------------------------------------
         elif porta_dest in _PORTAS_HTTPS or porta_orig in _PORTAS_HTTPS:
             protocolo_efetivo = "HTTPS"
             evento = {

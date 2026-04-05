@@ -52,6 +52,9 @@ class MotorPedagogico:
 
     def __init__(self):
         self._contadores: dict = {}
+        # Log interno de alertas educacionais HTTP — alimentado via hook
+        # em gerar_explicacao(), sem alterar nenhum retorno existente.
+        self._alertas_educacionais: list = []
 
     #  Interface pÃºblica 
 
@@ -77,7 +80,15 @@ class MotorPedagogico:
             "HTTP_CREDENTIALS": self._http_credenciais,
             "HTTP_REQUEST":     self._http_request,
         }
-        return geradores.get(tipo, self._generico)(evento)
+        resultado = geradores.get(tipo, self._generico)(evento)
+
+        # Hook educacional HTTP — fail-safe, não altera resultado
+        try:
+            self._hook_analise_educacional_http(evento, resultado)
+        except Exception:
+            pass
+
+        return resultado
 
     #  UtilitÃ¡rios internos 
 
@@ -117,6 +128,93 @@ class MotorPedagogico:
             if isinstance(v, str):
                 resultado[k] = _fix_mojibake(v)
         return resultado
+
+    # ── Hook educacional HTTP (camada adicional, fail-safe) ──
+
+    _KEYWORDS_SENSIVEIS = (
+        b"user", b"login", b"username", b"password", b"senha",
+        b"email", b"token", b"auth", b"cpf", b"credential",
+        b"passwd", b"pass", b"pwd", b"secret",
+    )
+
+    def _hook_analise_educacional_http(self, evento: dict, resultado: dict):
+        """
+        Análise educacional adicional para eventos HTTP.
+        Padrão fail-safe: nunca altera `resultado`, nunca lança exceção.
+        Alimenta self._alertas_educacionais para uso externo (ex.: Insights).
+        """
+        if evento.get("tipo") != "HTTP":
+            return
+
+        # Analisa payload bruto quando disponível
+        payload_raw = (
+            evento.get("payload_bruto") or
+            evento.get("payload_resumo") or
+            resultado.get("nivel4", "") or ""
+        )
+        payload_bytes = (
+            payload_raw.encode("utf-8", errors="ignore")
+            if isinstance(payload_raw, str) else payload_raw
+        )
+
+        findings = self._extrair_campos_sensiveis(payload_bytes)
+
+        # Também verifica pelo alerta gerado pelo motor
+        alerta_gerado = resultado.get("alerta_seguranca", "").lower()
+        if "credencial" in alerta_gerado or "exposta" in alerta_gerado:
+            if not findings:
+                findings = ["dados sensíveis (via alerta)"]
+
+        if findings:
+            self._emitir_alerta_educacional_http(evento, resultado, findings)
+
+    def _extrair_campos_sensiveis(self, payload_bytes: bytes) -> list:
+        """Extrai nomes de campos sensíveis presentes no payload HTTP."""
+        if not payload_bytes:
+            return []
+        payload_lower = payload_bytes.lower()
+        return [
+            kw.decode() for kw in self._KEYWORDS_SENSIVEIS
+            if kw in payload_lower
+        ]
+
+    def _emitir_alerta_educacional_http(self, evento: dict, resultado: dict,
+                                         findings: list):
+        """
+        Registra alerta educacional no log interno.
+        Mensagem formatada para uso didático em sala de aula.
+        """
+        if len(self._alertas_educacionais) >= 200:
+            self._alertas_educacionais.pop(0)
+
+        ip_origem = evento.get("ip_origem", "?")
+        ip_destino= evento.get("ip_destino", "?")
+        ts        = resultado.get("timestamp", "")
+        campos    = ", ".join(sorted(set(findings)))
+        mensagem  = (
+            f"[HTTP ALERT] {ts} · {ip_origem} → {ip_destino} "
+            f"| Dados sensíveis detectados: {campos} "
+            f"| ⚠ Um atacante pode interceptar essas informações (MITM)."
+        )
+        self._alertas_educacionais.append({
+            "timestamp":  ts,
+            "ip_origem":  ip_origem,
+            "ip_destino": ip_destino,
+            "campos":     campos,
+            "mensagem":   mensagem,
+            "nivel":      "CRÍTICO",
+        })
+
+    def obter_alertas_educacionais(self, ultimo_n: int = 20) -> list:
+        """
+        Retorna os últimos N alertas educacionais HTTP registrados.
+        API pública para uso por componentes externos (ex.: PainelEventos).
+        """
+        return list(self._alertas_educacionais[-ultimo_n:])
+
+    def resetar_alertas_educacionais(self):
+        """Limpa o log de alertas — chamar em nova sessão."""
+        self._alertas_educacionais.clear()
 
     @staticmethod
     def _fluxo(origem: str, protocolo: str, destino: str) -> str:
@@ -231,16 +329,28 @@ class MotorPedagogico:
         tamanho      = e.get("tamanho", 0)
         ttl          = e.get("ttl")
         linha_req    = e.get("http_linha_req", "")
-        metodo       = e.get("http_metodo", "") or "GET"
-        caminho      = e.get("http_caminho", "") or "/"
+        # Aceita tanto os campos do analisador_pacotes (metodo, recurso,
+        # payload_bruto) quanto os campos estendidos do DPI (http_metodo,
+        # http_caminho, payload_resumo) — compatibilidade total com ambos.
+        metodo       = e.get("http_metodo") or e.get("metodo", "") or "GET"
+        caminho      = e.get("http_caminho") or e.get("recurso", "") or "/"
         versao       = e.get("http_versao", "") or "HTTP/1.1"
         host         = e.get("http_host", "")
         headers      = e.get("http_headers", {}) or {}
         headers_raw  = e.get("http_headers_raw", "") or ""
-        corpo        = e.get("http_corpo", "") or ""
+        corpo        = e.get("http_corpo", "") or e.get("corpo", "") or e.get("payload_resumo", "") or ""
+        if isinstance(corpo, bytes):
+            corpo = corpo.decode('utf-8', errors='ignore')
         cookie       = e.get("http_cookie", "")
         content_type = e.get("http_content_type", "") or ""
-        payload_raw  = e.get("payload_resumo", "") or ""
+        payload_raw  = e.get("payload_resumo") or e.get("payload_bruto", "") or ""
+
+        # Se o analisador enviou credenciais como lista de (chave, valor),
+        # reconstrói o corpo para que os campos sensíveis sejam detectados.
+        creds_raw = e.get("credenciais", [])
+        if creds_raw and not corpo:
+            corpo = "&".join(f"{k}={v}" for k, v in creds_raw)
+            content_type = content_type or "application/x-www-form-urlencoded"
         metodo_up    = metodo.upper()
         alvo   = host or destino
         titulo = f"HTTP sem criptografia â€” {metodo} {alvo}{caminho}"

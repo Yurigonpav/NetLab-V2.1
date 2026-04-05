@@ -123,13 +123,14 @@ class _CapturadorPacotesThread(QThread):
     def run(self):
         self._running = True
         try:
-            from scapy.all import AsyncSniffer, IP, TCP, UDP, ARP, DNS, Ether, Raw
+            from scapy.all import AsyncSniffer, TCPSession, IP, TCP, UDP, ARP, DNS, Ether, Raw
 
             self.sniffer = AsyncSniffer(
                 iface=self.interface,
                 prn=self._processar_pacote,
                 store=False,
-                filter="ip"
+                filter="ip",
+                session=TCPSession
             )
             self.sniffer.start()
 
@@ -198,8 +199,13 @@ class _CapturadorPacotesThread(QThread):
                 dados["mac_destino"] = packet[ARP].hwdst
             dados["arp_op"] = "request" if packet[ARP].op == 1 else "reply"
 
-        # Captura payload para HTTP (porta 80) e armazena como bytes
-        if dados.get("porta_destino") == 80 and packet.haslayer(Raw):
+        # Captura payload para HTTP (portas 80, 8080, 8000) — cliente e servidor
+        _HTTP_PORTS = {80, 8080, 8000}
+        _porta_d = dados.get("porta_destino")
+        _porta_o = dados.get("porta_origem")
+        if packet.haslayer(Raw) and (
+            _porta_d in _HTTP_PORTS or _porta_o in _HTTP_PORTS
+        ):
             dados["payload"] = packet[Raw].load
 
         fila_pacotes_global.adicionar(dados)
@@ -762,7 +768,14 @@ class JanelaPrincipal(QMainWindow):
                         if status == "NOVO" and self.estado_rede.deve_emitir_evento(f"novo_{ip}", cooldown=30):
                             self.fila_eventos_ui.append(evento)
                 else:
-                    chave = f"{evento['tipo']}_{evento.get('ip_origem')}_{evento.get('dominio', '')}"
+                    # Inclui recurso e metodo para que cada endpoint/método
+                    # HTTP tenha seu próprio cooldown (evita suprimir POST /login
+                    # porque GET /login já foi mostrado recentemente).
+                    _disc = (
+                        evento.get("dominio", "")
+                        or f"{evento.get('metodo', '')}:{evento.get('recurso', '')}"
+                    )
+                    chave = f"{evento['tipo']}_{evento.get('ip_origem')}_{_disc}"
                     if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
                         self.fila_eventos_ui.append(evento)
 
@@ -814,7 +827,13 @@ class JanelaPrincipal(QMainWindow):
         self.fila_eventos_ui.clear()
         agregados = self._agregar_eventos(lote)
         for ev in agregados:
-            chave_visual = (ev.get("tipo"), ev.get("ip_origem"), ev.get("ip_destino"), ev.get("dominio", ""))
+            # Para HTTP, inclui método + recurso na chave visual para não
+            # suprimir permanentemente requisições ao mesmo par de IPs.
+            _disc_visual = (
+                ev.get("dominio", "")
+                or f"{ev.get('metodo', '')}:{ev.get('recurso', '')}"
+            )
+            chave_visual = (ev.get("tipo"), ev.get("ip_origem"), ev.get("ip_destino"), _disc_visual)
             if chave_visual in self.eventos_mostrados_recentemente:
                 continue
             self.eventos_mostrados_recentemente.append(chave_visual)

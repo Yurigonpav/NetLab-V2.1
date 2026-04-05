@@ -147,6 +147,256 @@ class PainelContadores(QWidget):
                 self._labels[tipo].setText(f"{icone} {tipo}: 0")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Motor de Insights Local
+# ───────────────────────────────────────────────────────────────
+# Agrega estatísticas educacionais a partir dos eventos que já
+# passam pelo PainelEventos.  Alimentado via hook em
+# adicionar_evento() — completamente fail-safe e não-intrusivo.
+# Não cria arquivos, não abre sockets, não bloqueia a UI.
+# ═══════════════════════════════════════════════════════════════
+class _MotorInsightsLocal:
+    """Agrega domínios DNS, métodos HTTP, top IPs e alertas de credenciais."""
+
+    CAMPOS_SENSIVEIS = frozenset({
+        "senha", "password", "pass", "pwd", "user", "usuario",
+        "login", "email", "token", "auth", "credential", "cpf",
+        "pin", "ssn", "username", "nome",
+    })
+
+    def __init__(self):
+        self.resetar()
+
+    # ── Ciclo de vida ──────────────────────────────────────
+
+    def resetar(self):
+        self._domain_counter:    defaultdict = defaultdict(int)
+        self._http_actions:      dict        = {"GET": 0, "POST": 0, "OTHER": 0}
+        self._ip_eventos:        defaultdict = defaultdict(int)
+        self._alertas_criticos:  list        = []   # (ts, ip, [campos])
+        self._total_http:        int         = 0
+        self._total_dns:         int         = 0
+        self._total_alimentados: int         = 0
+        self._versao:            int         = 0    # incrementa a cada mudança
+
+    # ── Hook principal ─────────────────────────────────────
+
+    def alimentar(self, evento: dict):
+        """
+        Chamado por PainelEventos.adicionar_evento() para cada evento
+        já processado pelo motor pedagógico.  Nunca lança exceção.
+        """
+        try:
+            self._total_alimentados += 1
+            self._versao += 1
+            tipo = evento.get("tipo", "")
+            ip   = evento.get("ip_envolvido") or evento.get("ip_origem") or ""
+
+            # ── DNS ──────────────────────────────────────────────
+            if tipo == "DNS":
+                self._total_dns += 1
+                dominio = evento.get("dominio", "")
+                if not dominio:
+                    titulo  = evento.get("titulo", "")
+                    dominio = titulo.split("—")[-1].strip() if "—" in titulo else ""
+                    # fallback: extrair de nivel1 (contém o domínio destacado)
+                    if not dominio:
+                        import re as _re
+                        m = _re.search(r"<b[^>]*>([^<]{3,80})</b>", evento.get("nivel1", ""))
+                        if m:
+                            dominio = m.group(1).strip()
+                if dominio:
+                    self._domain_counter[dominio] += 1
+
+            # ── HTTP ─────────────────────────────────────────────
+            elif tipo == "HTTP":
+                self._total_http += 1
+                # extrai método do próprio evento ou do título
+                metodo = evento.get("metodo", "")
+                if not metodo:
+                    titulo = evento.get("titulo", "")
+                    for m in ("POST", "GET", "PUT", "DELETE", "HEAD", "OPTIONS"):
+                        if m in titulo:
+                            metodo = m
+                            break
+                metodo_up = (metodo or "").upper()
+                if metodo_up == "GET":
+                    self._http_actions["GET"] += 1
+                elif metodo_up == "POST":
+                    self._http_actions["POST"] += 1
+                else:
+                    self._http_actions["OTHER"] += 1
+
+                # detecta credenciais via alerta_seguranca do motor pedagógico
+                alerta = (evento.get("alerta_seguranca") or "").lower()
+                if any(s in alerta for s in ("credencial", "senha", "password", "exposta", "text")):
+                    campos = [c for c in self.CAMPOS_SENSIVEIS if c in alerta]
+                    ts = evento.get("timestamp", "")
+                    if ip and len(self._alertas_criticos) < 50:
+                        self._alertas_criticos.append((ts, ip, campos or ["dados sensíveis"]))
+
+            # ── Tráfego por IP ────────────────────────────────────
+            if ip:
+                self._ip_eventos[ip] += 1
+
+        except Exception:
+            pass
+
+    # ── Geração de cards para a aba Insights ──────────────
+
+    def gerar_cards(self) -> list:
+        """Retorna lista de dicts compatíveis com PainelEventos._criar_card_insight()."""
+        cards = []
+
+        # ── Card: métodos HTTP ────────────────────────────────
+        if self._total_http > 0:
+            total  = self._total_http
+            gets   = self._http_actions["GET"]
+            posts  = self._http_actions["POST"]
+            others = self._http_actions["OTHER"]
+            pct_p  = round(posts / total * 100) if total else 0
+            nivel  = "critico" if posts > 0 else "aviso"
+
+            html_http = (
+                f"<table style='width:100%;border-collapse:collapse;font-size:10px;'>"
+                f"<tr><td style='color:#7f8c8d;padding:3px 16px 3px 0;'>GET</td>"
+                f"<td style='color:#3498DB;font-family:Consolas;'>{gets}</td>"
+                f"<td style='color:#7f8c8d;font-size:9px;padding-left:10px;'>"
+                f"navegação / leitura</td></tr>"
+                f"<tr><td style='color:#7f8c8d;padding:3px 16px 3px 0;'>POST</td>"
+                f"<td style='color:#E74C3C;font-family:Consolas;font-weight:bold;'>{posts}</td>"
+                f"<td style='color:#E74C3C;font-size:9px;padding-left:10px;'>"
+                + (f"⚠ {pct_p}% do total — dados enviados sem criptografia" if posts else "nenhum") +
+                f"</td></tr>"
+            )
+            if others:
+                html_http += (
+                    f"<tr><td style='color:#7f8c8d;padding:3px 16px 3px 0;'>Outros</td>"
+                    f"<td style='color:#E67E22;font-family:Consolas;'>{others}</td>"
+                    f"<td></td></tr>"
+                )
+            html_http += (
+                f"</table>"
+                f"<div style='margin-top:8px;padding:6px 10px;"
+                f"background:#1a0a00;border-left:3px solid #E74C3C;"
+                f"border-radius:0 4px 4px 0;color:#ecf0f1;font-size:10px;'>"
+                f"⚠ Dados sensíveis enviados via HTTP (sem criptografia). "
+                f"Um atacante na mesma rede pode interceptar essas informações (MITM)."
+                f"</div>"
+            )
+            cards.append({
+                "titulo":         f"HTTP sem criptografia — {total} requisição(ões)",
+                "descricao":      "Distribuição de métodos HTTP capturados nesta sessão",
+                "nivel_urgencia": nivel,
+                "html":           html_http,
+            })
+
+        # ── Card: credenciais expostas ────────────────────────
+        if self._alertas_criticos:
+            rows = ""
+            for ts, ip_src, campos in self._alertas_criticos[-8:]:
+                campos_str = ", ".join(campos) if campos else "dados sensíveis"
+                rows += (
+                    f"<tr>"
+                    f"<td style='color:#7f8c8d;font-size:9px;padding:3px 12px 3px 0;"
+                    f"white-space:nowrap;'>{ts}</td>"
+                    f"<td style='color:#E74C3C;font-family:Consolas;font-size:10px;"
+                    f"padding:3px 12px 3px 0;'>{ip_src}</td>"
+                    f"<td style='color:#E67E22;font-size:9px;'>{campos_str}</td>"
+                    f"</tr>"
+                )
+            html_creds = (
+                f"<div style='background:#1a0000;border:1px solid #E74C3C;"
+                f"border-radius:4px;padding:8px 10px;margin-bottom:8px;'>"
+                f"<span style='color:#E74C3C;font-size:10px;font-weight:bold;'>"
+                f"⚠ RISCO CRÍTICO: credenciais expostas em HTTP</span><br>"
+                f"<span style='color:#ecf0f1;font-size:10px;'>"
+                f"Este ataque é trivial em qualquer rede Wi-Fi — "
+                f"qualquer dispositivo na mesma rede pode capturar esses dados.</span>"
+                f"</div>"
+                f"<table style='width:100%;border-collapse:collapse;font-size:10px;'>"
+                f"<tr>"
+                f"<th style='color:#7f8c8d;text-align:left;font-weight:normal;"
+                f"padding-bottom:4px;font-size:9px;'>Hora</th>"
+                f"<th style='color:#7f8c8d;text-align:left;font-weight:normal;font-size:9px;'>"
+                f"IP Origem</th>"
+                f"<th style='color:#7f8c8d;text-align:left;font-weight:normal;font-size:9px;'>"
+                f"Campos detectados</th></tr>"
+                f"{rows}</table>"
+            )
+            cards.append({
+                "titulo":         f"⚠ RISCO CRÍTICO — {len(self._alertas_criticos)} credencial(is) exposta(s)",
+                "descricao":      "Credenciais capturadas em texto puro via HTTP",
+                "nivel_urgencia": "critico",
+                "html":           html_creds,
+            })
+
+        # ── Card: top domínios DNS ────────────────────────────
+        if self._domain_counter:
+            top = sorted(
+                self._domain_counter.items(), key=lambda x: x[1], reverse=True
+            )[:10]
+            maximo = top[0][1] if top else 1
+            rows_dns = ""
+            for dom, cnt in top:
+                pct = max(4, int(cnt / maximo * 100))
+                rows_dns += (
+                    f"<tr>"
+                    f"<td style='color:#ecf0f1;font-family:Consolas;font-size:10px;"
+                    f"padding:3px 14px 3px 0;max-width:220px;overflow:hidden;"
+                    f"text-overflow:ellipsis;white-space:nowrap;'>{dom}</td>"
+                    f"<td style='padding:3px 0;min-width:90px;'>"
+                    f"<div style='background:#1a4a6b;height:8px;border-radius:3px;"
+                    f"width:{pct}%;'></div></td>"
+                    f"<td style='color:#3498DB;font-family:Consolas;font-size:10px;"
+                    f"padding:3px 0 3px 10px;white-space:nowrap;'>{cnt}×</td>"
+                    f"</tr>"
+                )
+            html_dns = (
+                f"<table style='width:100%;border-collapse:collapse;'>"
+                f"{rows_dns}</table>"
+            )
+            cards.append({
+                "titulo":         f"Top domínios DNS — {len(self._domain_counter)} únicos",
+                "descricao":      f"Baseado em {self._total_dns} consultas DNS capturadas",
+                "nivel_urgencia": "info",
+                "html":           html_dns,
+            })
+
+        # ── Card: top IPs por eventos ─────────────────────────
+        if self._ip_eventos:
+            top_ips = sorted(
+                self._ip_eventos.items(), key=lambda x: x[1], reverse=True
+            )[:8]
+            maximo = top_ips[0][1] if top_ips else 1
+            rows_ip = ""
+            for ip_addr, evts in top_ips:
+                pct = max(4, int(evts / maximo * 100))
+                rows_ip += (
+                    f"<tr>"
+                    f"<td style='color:#ecf0f1;font-family:Consolas;font-size:10px;"
+                    f"padding:3px 14px 3px 0;white-space:nowrap;'>{ip_addr}</td>"
+                    f"<td style='padding:3px 0;min-width:90px;'>"
+                    f"<div style='background:#1e3a5f;height:8px;border-radius:3px;"
+                    f"width:{pct}%;'></div></td>"
+                    f"<td style='color:#2ECC71;font-family:Consolas;font-size:10px;"
+                    f"padding:3px 0 3px 10px;white-space:nowrap;'>{evts} evt</td>"
+                    f"</tr>"
+                )
+            html_ips = (
+                f"<table style='width:100%;border-collapse:collapse;'>"
+                f"{rows_ip}</table>"
+            )
+            cards.append({
+                "titulo":         f"Top IPs — {len(self._ip_eventos)} dispositivo(s) ativo(s)",
+                "descricao":      "Ordenado por volume de eventos capturados nesta sessão",
+                "nivel_urgencia": "info",
+                "html":           html_ips,
+            })
+
+        return cards
+
+
 class PainelEventos(QWidget):
     """
     Painel completo do Modo Análise com três níveis de explicação.
@@ -166,6 +416,9 @@ class PainelEventos(QWidget):
         self._filtro_protocolo:  str  = "Todos"
         self._filtro_texto:      str  = ""
         self._contagem_sessao:   dict = defaultdict(lambda: defaultdict(int))
+        # Motor de insights local — agrega dados de eventos sem estado externo
+        self._insights_local            = _MotorInsightsLocal()
+        self._insights_versao_renderizada: int = -1
         self._montar_layout()
 
     # ──────────────────────────────────────────────
@@ -540,7 +793,11 @@ class PainelEventos(QWidget):
         """
         Compatibilidade com o código legado — usado como fallback
         quando o MotorCorrelacao não estiver disponível.
+
+        Extensão: renderiza cards locais gerados por _MotorInsightsLocal
+        enquanto não houver MotorCorrelacao externo configurado.
         """
+        # ── Legado (sem alteração) ─────────────────────────
         if hasattr(self, "tabela_dns"):
             self.tabela_dns.setRowCount(len(top_dns))
             for i, dom in enumerate(top_dns):
@@ -551,6 +808,46 @@ class PainelEventos(QWidget):
         if hasattr(self, "lista_hist"):
             texto = "\n".join(f"• {h}" for h in historias) if historias else "Nenhuma história gerada ainda."
             self.lista_hist.setPlainText(texto)
+
+        # ── Extensão: cards locais ─────────────────────────
+        try:
+            versao_atual = self._insights_local._versao
+            if versao_atual == self._insights_versao_renderizada:
+                return  # dados não mudaram — evita rebuilds desnecessários
+
+            cards = self._insights_local.gerar_cards()
+            if not cards:
+                return  # sem dados ainda — mantém placeholder
+
+            self._insights_versao_renderizada = versao_atual
+
+            # Limpa layout de insights
+            while self._layout_insights.count() > 0:
+                item = self._layout_insights.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            # Renderiza cada card
+            for card_data in cards:
+                card_widget = self._criar_card_insight(card_data)
+                self._layout_insights.addWidget(card_widget)
+
+            self._layout_insights.addStretch()
+
+            # Atualiza rodapé
+            total_ev = self._insights_local._total_alimentados
+            n_http   = self._insights_local._total_http
+            n_dns    = self._insights_local._total_dns
+            n_alertas= len(self._insights_local._alertas_criticos)
+            resumo   = f"{total_ev} eventos · {n_dns} DNS · {n_http} HTTP"
+            if n_alertas:
+                resumo += f" · ⚠ {n_alertas} credencial(is) exposta(s)"
+            self._lbl_resumo_correlacao.setText(resumo)
+            self._lbl_total_eventos_correlacionados.setText(
+                f"{total_ev:,} eventos analisados"
+            )
+        except Exception:
+            pass
 
     def adicionar_evento(self, dados: dict):
         """Recebe um evento do motor pedagógico e exibe na interface."""
@@ -587,6 +884,12 @@ class PainelEventos(QWidget):
         self._renderizar_explicacao()
         self._atualizar_rodape()
 
+        # Hook insights local — fail-safe, não altera fluxo original
+        try:
+            self._insights_local.alimentar(dados)
+        except Exception:
+            pass
+
     def limpar(self):
         self._todos_eventos.clear()
         self._eventos_filtrados.clear()
@@ -611,6 +914,13 @@ class PainelEventos(QWidget):
 
         self.lbl_rodape.setText("Nenhum evento registrado.")
         self._exibir_boas_vindas()
+
+        # Reseta motor de insights local
+        try:
+            self._insights_local.resetar()
+            self._insights_versao_renderizada = -1
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────
     # Filtros
