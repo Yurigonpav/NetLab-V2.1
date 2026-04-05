@@ -767,7 +767,7 @@ class MotorPedagogico:
     def _dns(self, e: dict) -> dict:
         origem  = e.get("ip_origem", "?")
         destino = e.get("ip_destino", "?")
-        dominio = e.get("dns_query", "")
+        dominio = e.get("dominio", "")
         porta   = e.get("porta_destino") or 53
         tamanho = e.get("tamanho", 0)
         titulo  = f"Consulta DNS â€” {dominio}" if dominio else "Consulta DNS"
