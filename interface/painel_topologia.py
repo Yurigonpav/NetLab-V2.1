@@ -227,7 +227,10 @@ class VisualizadorTopologia(QWidget):
         self._fase_animacao = 0
         timer = QTimer(self)
         timer.timeout.connect(self._passo_animacao)
-        timer.start(40)
+        # Reduzido de 40ms (25fps) para 100ms (10fps).
+        # 10fps é perfeitamente fluido para animação de pulso do nó local
+        # e economiza ~60% do CPU gasto em redraws desnecessários.
+        timer.start(100)
 
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
@@ -719,7 +722,14 @@ class VisualizadorTopologia(QWidget):
 
     def _passo_animacao(self):
         self._fase_animacao += 1
-        self.update()
+        # Redesenha apenas quando necessário:
+        #   • Sempre que o nó local existir (pulso animado precisa de update contínuo)
+        #   • A cada 4 ticks (~400ms) para manter hover/tooltip responsivos
+        #     sem redesenhar a cada 100ms quando não há animação ativa.
+        if self._ip_local and self._ip_local in self._posicoes_mundo:
+            self.update()
+        elif self._fase_animacao % 4 == 0:
+            self.update()
 
     def resizeEvent(self, evento):
         self._auto_zoom()

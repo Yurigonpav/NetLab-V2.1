@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QTextEdit,
     QDialogButtonBox, QFrame
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal, QObject, QRunnable, QThreadPool
 from PyQt6.QtGui import QAction, QFont
 
 from analisador_pacotes import AnalisadorPacotes
@@ -304,23 +304,75 @@ class _DescobrirDispositivosThread(QThread):
                 self.erro_ocorrido.emit("Não foi possível determinar a sub-rede.")
                 return
 
-            self.progresso_atualizado.emit(f"Varredura ARP ({rede})...")
+            self.progresso_atualizado.emit(f"Varredura ARP ({rede}) — fase 1/2...")
 
             from scapy.all import arping
-            resultado = arping(rede, iface=self.interface, timeout=2, verbose=False)
+            import ipaddress
+
+            # ── FASE 1: ARP broadcast com timeout estendido ──────────────
+            # timeout=2 era insuficiente em redes corporativas com >100 hosts
+            # ou switches com STP/port security. Aumentado para 4s.
+            resultado = arping(rede, iface=self.interface, timeout=4, verbose=False)
 
             dispositivos = []
             vistos: set = set()
+            ips_vistos: set = set()
             for _, received in resultado[0]:
                 ip, mac = received.psrc, received.hwsrc
                 if not self._ip_util(ip) or (ip, mac) in vistos:
                     continue
                 vistos.add((ip, mac))
+                ips_vistos.add(ip)
                 dispositivos.append((ip, mac, ""))
                 self.dispositivo_encontrado.emit(ip, mac, "")
 
+            # ── FASE 2: ICMP sweep para hosts que bloqueiam ARP ──────────
+            # VMs, firewalls e hosts com ARP filtering não respondem ARP
+            # mas respondem ICMP Echo. Esta fase cobre essa lacuna.
+            if self.habilitar_ping:
+                try:
+                    rede_obj = ipaddress.ip_network(rede, strict=False)
+                    hosts_todos = [str(h) for h in list(rede_obj.hosts())[:254]]
+                    hosts_pendentes = [h for h in hosts_todos if h not in ips_vistos]
+
+                    self.progresso_atualizado.emit(
+                        f"Fase 2/2: ICMP sweep em {len(hosts_pendentes)} host(s) restante(s)..."
+                    )
+
+                    from scapy.all import srp, Ether, IP, ICMP
+
+                    # Processa em lotes de 32 para controlar uso de memória
+                    # e evitar flood que trigger port-security em switches
+                    LOTE = 32
+                    for i in range(0, len(hosts_pendentes), LOTE):
+                        lote = hosts_pendentes[i:i + LOTE]
+                        pacotes = [
+                            Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=h) / ICMP()
+                            for h in lote
+                        ]
+                        try:
+                            respostas, _ = srp(
+                                pacotes,
+                                iface=self.interface,
+                                timeout=1,
+                                verbose=False,
+                            )
+                            for _, r in respostas:
+                                if not r.haslayer(IP):
+                                    continue
+                                ip  = r[IP].src
+                                mac = r[Ether].src if r.haslayer(Ether) else ""
+                                if self._ip_util(ip) and ip not in ips_vistos:
+                                    ips_vistos.add(ip)
+                                    dispositivos.append((ip, mac, ""))
+                                    self.dispositivo_encontrado.emit(ip, mac, "")
+                        except Exception:
+                            pass  # lote individual falhou — continua os demais
+                except Exception as e:
+                    self.progresso_atualizado.emit(f"ICMP sweep parcialmente falhou: {e}")
+
             self.progresso_atualizado.emit(
-                f"Varredura concluída: {len(dispositivos)} dispositivo(s)."
+                f"Varredura concluída: {len(dispositivos)} dispositivo(s) encontrado(s)."
             )
             self.varredura_concluida.emit(dispositivos)
 
@@ -364,7 +416,57 @@ class _DescobrirDispositivosThread(QThread):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Worker para processamento pedagógico em thread separada
+# Sinal global thread-safe para resultados pedagógicos
+# (necessário porque QRunnable não pode ter pyqtSignal diretamente)
+# ════════════════════════════════════════════════════════════════════════
+
+class _SinalPedagogico(QObject):
+    resultado = pyqtSignal(dict)
+
+_sinal_pedagogico_global = _SinalPedagogico()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Worker leve para QThreadPool — substitui QThread por evento
+# ════════════════════════════════════════════════════════════════════════
+
+class _WorkerRunnable(QRunnable):
+    """
+    QRunnable para processamento pedagógico no pool de threads global.
+    Muito mais eficiente que criar/destruir um QThread por evento:
+      - Sem overhead de criação/destruição de thread do SO
+      - Pool limitado a N threads simultâneas (sem vazamento)
+      - Auto-delete após execução (setAutoDelete(True))
+    """
+
+    def __init__(self, evento: dict, motor):
+        super().__init__()
+        self.evento = evento
+        self.motor  = motor
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            explicacao = self.motor.gerar_explicacao(self.evento)
+            if explicacao is None:
+                explicacao = {
+                    "nivel1": f"Evento: {self.evento.get('tipo', 'Desconhecido')}",
+                    "nivel2": (
+                        f"Origem: {self.evento.get('ip_origem', '?')} → "
+                        f"Destino: {self.evento.get('ip_destino', '?')}"
+                    ),
+                    "nivel3": f"Dados: {self.evento}",
+                    "icone": "🔍", "nivel": "INFO",
+                    "alerta_seguranca": "",
+                }
+            explicacao["sessao_id"] = self.evento.get("sessao_id")
+            _sinal_pedagogico_global.resultado.emit(explicacao)
+        except Exception as e:
+            print(f"[Worker pedagógico] Erro: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Worker legado — mantido apenas para compatibilidade interna
 # ════════════════════════════════════════════════════════════════════════
 
 class WorkerPedagogico(QObject):
@@ -436,6 +538,18 @@ class JanelaPrincipal(QMainWindow):
         self.estado_rede = EstadoRede()
         self.fila_eventos_ui: deque = deque(maxlen=500)
         self.eventos_mostrados_recentemente: deque = deque(maxlen=200)
+
+        # ── Pool de threads para processamento pedagógico ─────────────
+        # Substitui a criação de QThread por evento (que causava vazamento).
+        # Máximo de 4 threads simultâneas — suficiente para DPI sem
+        # saturar a CPU em capturas de alto volume.
+        self._thread_pool = QThreadPool.globalInstance()
+        self._thread_pool.setMaxThreadCount(4)
+        # Conecta o sinal global uma única vez à UI thread
+        _sinal_pedagogico_global.resultado.connect(self._finalizar_exibicao_evento)
+
+        # EMA para suavização do KB/s (evita spikes no gráfico)
+        self._kb_anterior: float = 0.0
 
         # ── Timers ────────────────────────────────────────────────────
         # _consumir_fila: apenas enfileira no analisador + coleta resultados
@@ -857,9 +971,14 @@ class JanelaPrincipal(QMainWindow):
                     )
                     chave = f"{tipo}_{ip_origem}_{_disc}"
                     
-                    # NOVO: DNS não tem cooldown (permitir todas as consultas)
+                    # DNS: cooldown por domínio (3s) — evita flood de eventos
+                    # na UI sem perder consultas a domínios distintos.
+                    # Antes: sem cooldown → centenas de eventos/min em redes ativas.
                     if tipo == "DNS":
-                        self.fila_eventos_ui.append(evento)
+                        dominio = evento.get("dominio", "")
+                        chave_dns = f"DNS_{ip_origem}_{dominio}"
+                        if self.estado_rede.deve_emitir_evento(chave_dns, cooldown=3):
+                            self.fila_eventos_ui.append(evento)
                     else:
                         if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
                             self.fila_eventos_ui.append(evento)
@@ -934,10 +1053,22 @@ class JanelaPrincipal(QMainWindow):
         total_bytes   = snap.get("total_bytes",   0)
         total_pacotes = snap.get("total_pacotes", 0)
 
-        agora     = time.perf_counter()
-        delta_t   = max(agora - self._instante_anterior, 0.001)
-        delta_b   = total_bytes - self._bytes_total_anterior
-        kb_por_s  = (delta_b / 1024.0) / delta_t
+        agora   = time.perf_counter()
+        delta_t = agora - self._instante_anterior
+
+        # Guarda mínimo de 0.5s para evitar spikes por invocações rápidas
+        # (timer_ui = 1500ms, mas pode ser chamado manualmente em parar_captura)
+        if delta_t < 0.5:
+            delta_t = max(delta_t, 0.001)
+
+        delta_b  = max(0, total_bytes - self._bytes_total_anterior)
+        kb_raw   = (delta_b / 1024.0) / delta_t
+
+        # Média Móvel Exponencial (EMA α=0.3) — suaviza spikes sem atrasar demais
+        # α alto → reage rápido; α baixo → mais suave. 0.3 é um bom equilíbrio.
+        alpha = 0.3
+        kb_por_s = alpha * kb_raw + (1.0 - alpha) * self._kb_anterior
+        self._kb_anterior = kb_por_s
 
         self._bytes_total_anterior = total_bytes
         self._instante_anterior    = agora
@@ -967,26 +1098,19 @@ class JanelaPrincipal(QMainWindow):
     # ── Exibição de evento pedagógico ─────────────────────────────────
 
     def _exibir_evento_pedagogico(self, evento: dict):
+        """
+        Despacha o processamento pedagógico para o pool de threads global.
+        
+        Antes: criava um QThread + QObject por evento → vazamento de threads,
+        alto consumo de CPU/RAM em capturas longas (centenas de threads ativas).
+        
+        Agora: usa QRunnable no QThreadPool (máx. 4 workers simultâneos).
+        Overhead por evento: ~0 (sem criação/destruição de thread do SO).
+        O resultado chega via _sinal_pedagogico_global.resultado → UI thread.
+        """
         evento["sessao_id"] = self.sessao_id
-        
-        # Cria thread e worker
-        self.worker_thread = QThread()
-        self.worker = WorkerPedagogico(evento, self.motor_pedagogico)
-        self.worker.moveToThread(self.worker_thread)
-        
-        # Conecta sinais
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.resultado_pronto.connect(self._finalizar_exibicao_evento)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker_thread.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-        
-        # Armazena para limpeza posterior
-        if not hasattr(self, '_worker_threads'):
-            self._worker_threads = []
-        self._worker_threads.append(self.worker_thread)
-        
-        self.worker_thread.start()
+        runnable = _WorkerRunnable(evento, self.motor_pedagogico)
+        self._thread_pool.start(runnable)
 
     def _finalizar_exibicao_evento(self, explicacao: dict):
         self.painel_eventos.adicionar_evento(explicacao)
@@ -1001,16 +1125,9 @@ class JanelaPrincipal(QMainWindow):
         )
 
     def _finalizar_workers(self):
-        if not hasattr(self, '_worker_threads'):
-            return
-        for thread in self._worker_threads:
-            if thread.isRunning():
-                thread.quit()
-                if not thread.wait(2000):
-                    thread.terminate()
-                    thread.wait()
-            thread.deleteLater()
-        self._worker_threads.clear()
+        # Aguarda todos os workers do pool terminarem (máx. 3s)
+        # Não há lista de threads para limpar — o pool gerencia tudo.
+        self._thread_pool.waitForDone(3000)
 
     # ── Descoberta periódica de dispositivos ──────────────────────────
 
