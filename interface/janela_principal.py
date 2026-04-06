@@ -1,30 +1,19 @@
-# interface/janela_principal.py
-# Janela principal do NetLab Educacional — VERSÃO OTIMIZADA v3.0
+﻿# interface/janela_principal.py
+# Janela principal do NetLab Educacional — versão com concorrência corrigida.
 #
-# ARQUITETURA DE PERFORMANCE
-# ──────────────────────────
-#  Captura (AsyncSniffer)
-#       │  fila_pacotes_global  ←  buffer circular deque(maxlen=5000)
-#       ▼                           evita acumulação ilimitada em picos
-#  _ProcessadorThread  (QThread background)
-#       │  Processa lotes de até MAX_LOTE pacotes por ciclo (50 ms)
-#       │  Possui seu próprio AnalisadorPacotes (sem disputa de lock com GUI)
-#       │  Emite sinais batch para a main thread:
-#       │    • snapshot_pronto(dict)    → estado consolidado a cada 500 ms
-#       │    • batch_conexoes(list)     → (ip_src, ip_dst, mac_src)
-#       │    • batch_eventos(list)      → eventos detectados
-#       │    • batch_banco(list)        → pacotes a salvar no DB
-#       ▼
-#  Main thread  (apenas recebe sinais e atualiza UI)
-#       │  timer_ui (1 s)       → gráfico de throughput + labels
-#       │  timer_insights (30 s) → passa snapshot p/ painel de insights
-#       │  timer_eventos (2 s)  → descarrega eventos na lista visual
-#       └  timer_descoberta (30 s) → varredura ARP periódica
+# CORREÇÕES DESTA VERSÃO
+# ─────────────────────────────────────────────────────────────────────────
+# 1. _EscritorBanco  — thread daemon que executa todos os commits SQLite
+#    fora da UI thread, eliminando o travamento causado por I/O de disco.
 #
-# EXTENSÃO C NATIVA (opcional)
-#  Se netlab_core estiver compilado e disponível, _ProcessadorThread usa
-#  nl_adicionar_pacote() para contagem/estatísticas de alta frequência,
-#  reduzindo overhead do Python puro para parsing/agregação.
+# 2. AnalisadorPacotes em modo assíncrono  — a análise de pacotes ocorre
+#    na ThreadAnalisador (já existente no analisador_pacotes.py), não mais
+#    no timer da UI thread.
+#    • _consumir_fila() apenas enfileira pacotes e coleta resultados prontos.
+#    • A UI thread nunca mais executa processar_pacote() diretamente.
+#
+# 3. _consumir_fila() simplificado  — sem nenhuma operação pesada; despacha
+#    dados para threads especializadas e atualiza apenas o snapshot em memória.
 
 import socket
 import threading
@@ -38,7 +27,7 @@ from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QTextEdit,
     QDialogButtonBox, QFrame
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QAction, QFont
 
 from analisador_pacotes import AnalisadorPacotes
@@ -49,22 +38,63 @@ from interface.painel_trafego import PainelTrafego
 from interface.painel_eventos import PainelEventos
 from painel_servidor import PainelServidor
 
-# Tenta carregar a extensão C nativa; usa fallback Python se ausente.
-try:
-    from netlab_core import NetlabCore as _NetlabCore
-    _CORE_NATIVO = True
-except ImportError:
-    _CORE_NATIVO = False
 
-# ============================================================================
-# EstadoRede
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════
+# Thread de escrita assíncrona no banco de dados
+# ════════════════════════════════════════════════════════════════════════
+
+class _EscritorBanco(threading.Thread):
+    """
+    Thread daemon que consome operações de escrita no SQLite de forma
+    assíncrona.  A UI thread nunca bloqueia em commit() novamente.
+
+    Uso:
+        escritor.enfileirar(banco.salvar_pacote, (args...))
+        escritor.enfileirar(banco.salvar_dispositivo, (args...))
+    """
+
+    def __init__(self, banco: BancoDados):
+        super().__init__(name="NetLab-EscritorBanco", daemon=True)
+        self._banco  = banco
+        self._fila:  deque = deque()
+        self._lock   = threading.Lock()
+        self._rodando = True
+
+    def enfileirar(self, metodo, args: tuple = ()):
+        """Adiciona uma operação à fila de escrita. Thread-safe."""
+        with self._lock:
+            self._fila.append((metodo, args))
+
+    def run(self):
+        while self._rodando:
+            lote = []
+            with self._lock:
+                while self._fila:
+                    lote.append(self._fila.popleft())
+
+            for metodo, args in lote:
+                try:
+                    metodo(*args)
+                except Exception:
+                    pass  # falhas de escrita não travam a aplicação
+
+            if not lote:
+                time.sleep(0.05)   # 50 ms de espera quando fila vazia
+
+    def parar(self):
+        self._rodando = False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Estado da rede (cooldown e dispositivos)
+# ════════════════════════════════════════════════════════════════════════
 
 class EstadoRede:
-    """Gerencia estado da rede, cooldown de eventos e descoberta de dispositivos."""
+    """Gerencia cooldown de eventos e descoberta de dispositivos."""
+
     def __init__(self):
-        self.ultimos_eventos = {}
-        self.dispositivos    = {}
+        self.ultimos_eventos: dict = {}
+        self.dispositivos:    dict = {}
         self._lock = threading.Lock()
 
     def deve_emitir_evento(self, chave: str, cooldown: int = 5) -> bool:
@@ -86,38 +116,21 @@ class EstadoRede:
     def obter_dispositivo(self, ip: str):
         return self.dispositivos.get(ip)
 
-    def resetar(self):
-        with self._lock:
-            self.ultimos_eventos.clear()
-            self.dispositivos.clear()
 
-# ============================================================================
-# Buffer Circular Global de Pacotes (thread-safe)
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════
+# Fila global de pacotes (preenchida pelo sniffer, consumida pelo analisador)
+# ════════════════════════════════════════════════════════════════════════
 
 class _FilaPacotesGlobal:
-    """
-    Buffer circular thread-safe usando deque(maxlen).
-    Com maxlen=5000 o deque descarta automaticamente pacotes antigos em
-    picos de tráfego, limitando o consumo de memória sem perder controle.
-    """
-    _CAPACIDADE = 5_000
+    """Buffer circular thread-safe. maxlen=5000 descarta automaticamente em picos."""
 
     def __init__(self):
-        self._fila = deque(maxlen=self._CAPACIDADE)
-        self._lock  = threading.Lock()
+        self._fila: deque = deque(maxlen=5_000)
+        self._lock = threading.Lock()
 
     def adicionar(self, pacote: dict):
         with self._lock:
             self._fila.append(pacote)
-
-    def consumir_lote(self, maximo: int = 200) -> list:
-        """Retira até `maximo` pacotes do buffer de forma atômica."""
-        with self._lock:
-            lote = []
-            for _ in range(min(maximo, len(self._fila))):
-                lote.append(self._fila.popleft())
-            return lote
 
     def consumir_todos(self) -> list:
         with self._lock:
@@ -129,15 +142,13 @@ class _FilaPacotesGlobal:
         with self._lock:
             self._fila.clear()
 
-    def tamanho(self) -> int:
-        return len(self._fila)
-
 
 fila_pacotes_global = _FilaPacotesGlobal()
 
-# ============================================================================
+
+# ════════════════════════════════════════════════════════════════════════
 # Funções auxiliares de rede
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════
 
 def obter_ip_local() -> str:
     try:
@@ -155,66 +166,66 @@ def obter_interfaces_disponiveis() -> list:
         return [
             iface.get('description', iface.get('name', ''))
             for iface in interfaces
-            if iface.get('description', '') and
-               'loopback' not in iface.get('description', '').lower()
+            if 'loopback' not in iface.get('description', '').lower()
         ]
     except Exception:
         return []
 
-# ============================================================================
-# Thread de Captura de Pacotes (AsyncSniffer)
-# ============================================================================
+
+# ════════════════════════════════════════════════════════════════════════
+# Thread do sniffer (AsyncSniffer do Scapy)
+# ════════════════════════════════════════════════════════════════════════
 
 class _CapturadorPacotesThread(QThread):
-    """Thread que captura pacotes usando AsyncSniffer do Scapy."""
+    """Captura pacotes via AsyncSniffer e os deposita na fila global."""
+
     erro_ocorrido = pyqtSignal(str)
     sem_pacotes   = pyqtSignal(str)
-
-    # Portas HTTP onde capturamos payload
-    _HTTP_PORTS = frozenset({80, 8080, 8000})
 
     def __init__(self, interface: str):
         super().__init__()
         self.interface = interface
-        self._running  = False
+        self._rodando  = False
         self.sniffer   = None
 
     def run(self):
-        self._running = True
+        self._rodando = True
         try:
             from scapy.all import AsyncSniffer, TCPSession
+
             self.sniffer = AsyncSniffer(
                 iface=self.interface,
                 prn=self._processar_pacote,
                 store=False,
                 filter="ip",
-                session=TCPSession
+                session=TCPSession,
             )
             self.sniffer.start()
-            while self._running:
+            while self._rodando:
                 self.sleep(1)
+
         except Exception as e:
-            self.erro_ocorrido.emit(f"Erro no AsyncSniffer: {str(e)}")
+            self.erro_ocorrido.emit(f"Erro no AsyncSniffer: {e}")
         finally:
             if self.sniffer and self.sniffer.running:
                 self.sniffer.stop()
 
     def _processar_pacote(self, packet):
-        if not self._running:
+        if not self._rodando:
             return
 
-        from scapy.all import Ether, IP, TCP, UDP, ARP, DNS, Raw
-
         dados = {
-            "tamanho":       len(packet),
-            "ip_origem":     None,
-            "ip_destino":    None,
-            "mac_origem":    None,
-            "mac_destino":   None,
-            "protocolo":     "Outro",
-            "porta_origem":  None,
-            "porta_destino": None,
+            "tamanho":      len(packet),
+            "ip_origem":    None,
+            "ip_destino":   None,
+            "mac_origem":   None,
+            "mac_destino":  None,
+            "protocolo":    "Outro",
+            "porta_origem": None,
+            "porta_destino":None,
         }
+
+        from scapy.all import Ether, IP, TCP, UDP, ARP, DNS, Raw
 
         if packet.haslayer(Ether):
             dados["mac_origem"]  = packet[Ether].src
@@ -235,6 +246,7 @@ class _CapturadorPacotesThread(QThread):
                     dados["flags"] = "FIN"
                 elif flags & 0x04:
                     dados["flags"] = "RST"
+
             elif packet.haslayer(UDP):
                 dados["protocolo"]     = "UDP"
                 dados["porta_origem"]  = packet[UDP].sport
@@ -242,168 +254,36 @@ class _CapturadorPacotesThread(QThread):
                 if packet.haslayer(DNS):
                     dados["protocolo"] = "DNS"
                     if packet[DNS].qr == 0 and packet[DNS].qd:
-                        qname = packet[DNS].qd.qname.decode('utf-8', errors='ignore')
-                        dados["dominio"] = qname.rstrip('.')
+                        dados["dominio"] = packet[DNS].qd.qname.decode(
+                            'utf-8', errors='ignore'
+                        ).rstrip('.')
 
         elif packet.haslayer(ARP):
             dados["protocolo"]  = "ARP"
             dados["ip_origem"]  = packet[ARP].psrc
             dados["ip_destino"] = packet[ARP].pdst
-            if not dados["mac_origem"]:
-                dados["mac_origem"]  = packet[ARP].hwsrc
-            if not dados["mac_destino"]:
-                dados["mac_destino"] = packet[ARP].hwdst
-            dados["arp_op"] = "request" if packet[ARP].op == 1 else "reply"
+            dados["mac_origem"] = dados["mac_origem"] or packet[ARP].hwsrc
+            dados["arp_op"]     = "request" if packet[ARP].op == 1 else "reply"
 
-        # Payload HTTP (apenas nas portas HTTP configuradas)
-        pd = dados.get("porta_destino")
-        po = dados.get("porta_origem")
-        if packet.haslayer(Raw) and (pd in self._HTTP_PORTS or po in self._HTTP_PORTS):
+        _HTTP_PORTS = {80, 8080, 8000}
+        if packet.haslayer(Raw) and (
+            dados.get("porta_destino") in _HTTP_PORTS or
+            dados.get("porta_origem")  in _HTTP_PORTS
+        ):
             dados["payload"] = packet[Raw].load
 
         fila_pacotes_global.adicionar(dados)
 
     def parar(self):
-        self._running = False
+        self._rodando = False
         if self.sniffer:
-            try:
-                self.sniffer.stop()
-            except Exception:
-                pass
+            self.sniffer.stop()
         self.wait(3000)
 
-# ============================================================================
-# Thread de Processamento de Pacotes (desacoplada da UI)
-# ============================================================================
 
-class _ProcessadorThread(QThread):
-    """
-    Background thread que:
-      1. Drena lotes do buffer circular fila_pacotes_global
-      2. Chama AnalisadorPacotes.processar_pacote() internamente
-      3. Emite sinais batch para que a main thread atualize UI e banco
-
-    DESACOPLAMENTO
-    ──────────────
-    Coleta (Sniffer) → fila_pacotes_global → _ProcessadorThread → signals → UI
-    Cada estágio opera em seu próprio ritmo; a fila absorve variações.
-
-    EXTENSÃO C NATIVA
-    ─────────────────
-    Se netlab_core estiver disponível, usa nl_adicionar_pacote() para
-    contabilidade de alta frequência (bytes/protocolo/segundo), evitando
-    overhead de dicionários Python em caminhos críticos.
-    """
-    snapshot_pronto = pyqtSignal(dict)   # estatísticas consolidadas (a cada ~500 ms)
-    batch_conexoes  = pyqtSignal(list)   # [(ip_src, ip_dst, mac_src), ...]
-    batch_eventos   = pyqtSignal(list)   # [evento_dict, ...]
-    batch_banco     = pyqtSignal(list)   # [dados_pacote, ...] para salvar no DB
-
-    _LOTE_MAXIMO     = 200   # pacotes por ciclo de processamento
-    _INTERVALO_MS    = 50    # intervalo de polling da fila (ms)
-    _CICLOS_SNAPSHOT = 10    # emite snapshot a cada N ciclos (10 × 50 ms = 500 ms)
-
-    # Mapeamento protocolo → índice para o núcleo C
-    _PROTO_IDX = {
-        "TCP": 0, "UDP": 1, "DNS": 2, "HTTP": 3,
-        "HTTPS": 4, "ARP": 5, "ICMP": 6, "DHCP": 7,
-        "TCP_SYN": 8,
-    }
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.analisador = AnalisadorPacotes()
-        self._running   = False
-        self._ciclos    = 0
-        self._core      = _NetlabCore() if _CORE_NATIVO else None
-
-    def resetar(self):
-        """Reinicia o estado interno do analisador (chamado antes de nova sessão)."""
-        self.analisador.resetar()
-        if self._core:
-            self._core.resetar()
-
-    def run(self):
-        self._running = True
-        self._ciclos  = 0
-        while self._running:
-            self._processar_lote()
-            self._ciclos += 1
-            if self._ciclos % self._CICLOS_SNAPSHOT == 0:
-                self._emitir_snapshot()
-            self.msleep(self._INTERVALO_MS)
-
-        # Drena e emite snapshot final antes de encerrar
-        self._processar_lote()
-        self._emitir_snapshot()
-
-    def _processar_lote(self):
-        pacotes = fila_pacotes_global.consumir_lote(self._LOTE_MAXIMO)
-        if not pacotes:
-            return
-
-        conexoes   = []
-        eventos    = []
-        banco_lote = []
-
-        for dados in pacotes:
-            evento     = self.analisador.processar_pacote(dados)
-            ip_origem  = dados.get("ip_origem",  "")
-            ip_destino = dados.get("ip_destino", "")
-            mac_origem = dados.get("mac_origem", "")
-            protocolo  = dados.get("protocolo",  "Outro")
-
-            # Registra no núcleo C para métricas de alta frequência
-            if self._core:
-                idx = self._PROTO_IDX.get(protocolo, 9)
-                self._core.adicionar_pacote(idx, dados.get("tamanho", 0))
-
-            if ip_origem or ip_destino:
-                conexoes.append((ip_origem, ip_destino, mac_origem))
-
-            if evento and evento.get("tipo"):
-                eventos.append(evento)
-
-            # Amostragem DB: 1 em cada 5 pacotes
-            if self.analisador.total_pacotes % 5 == 0:
-                banco_lote.append(dados)
-
-        # Emite apenas se houver dados para processar
-        if conexoes:
-            self.batch_conexoes.emit(conexoes)
-        if eventos:
-            self.batch_eventos.emit(eventos)
-        if banco_lote:
-            self.batch_banco.emit(banco_lote)
-
-    def _emitir_snapshot(self):
-        """Constrói e emite o snapshot consolidado de estatísticas."""
-        snap = {
-            "total_bytes":        self.analisador.total_bytes,
-            "total_pacotes":      self.analisador.total_pacotes,
-            "estatisticas":       self.analisador.obter_estatisticas_protocolos(),
-            "top_dispositivos":   self.analisador.obter_top_dispositivos(),
-            "dispositivos_ativos": len(
-                getattr(self.analisador, "trafego_dispositivos", {})
-            ),
-            "top_dns": self.analisador.obter_top_dns(),
-        }
-        # Enriquece com métricas do núcleo C se disponível
-        if self._core:
-            snap["bps_core"] = self._core.bytes_por_segundo(1000)
-        self.snapshot_pronto.emit(snap)
-
-    def obter_totais(self) -> tuple:
-        """Retorna (total_pacotes, total_bytes) — usado ao finalizar sessão."""
-        return self.analisador.total_pacotes, self.analisador.total_bytes
-
-    def parar(self):
-        self._running = False
-        self.wait(4000)
-
-# ============================================================================
-# Thread de Descoberta de Dispositivos (ARP)
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════
+# Thread de varredura ARP
+# ════════════════════════════════════════════════════════════════════════
 
 class _DescobrirDispositivosThread(QThread):
     dispositivo_encontrado = pyqtSignal(str, str, str)
@@ -421,27 +301,21 @@ class _DescobrirDispositivosThread(QThread):
         try:
             rede = self.cidr or self._cidr_por_interface() or self._cidr_por_ip_local()
             if not rede:
-                self.erro_ocorrido.emit(
-                    "Não foi possível determinar a sub-rede da interface selecionada."
-                )
+                self.erro_ocorrido.emit("Não foi possível determinar a sub-rede.")
                 return
 
-            self.progresso_atualizado.emit(f"Varredura ARP em andamento ({rede})...")
+            self.progresso_atualizado.emit(f"Varredura ARP ({rede})...")
 
             from scapy.all import arping
-            resultado  = arping(rede, iface=self.interface, timeout=2, verbose=False)
-            dispositivos = []
-            vistos     = set()
+            resultado = arping(rede, iface=self.interface, timeout=2, verbose=False)
 
-            for sent, received in resultado[0]:
-                ip  = received.psrc
-                mac = received.hwsrc
-                if not self._ip_util(ip):
+            dispositivos = []
+            vistos: set = set()
+            for _, received in resultado[0]:
+                ip, mac = received.psrc, received.hwsrc
+                if not self._ip_util(ip) or (ip, mac) in vistos:
                     continue
-                chave = (ip, mac)
-                if chave in vistos:
-                    continue
-                vistos.add(chave)
+                vistos.add((ip, mac))
                 dispositivos.append((ip, mac, ""))
                 self.dispositivo_encontrado.emit(ip, mac, "")
 
@@ -449,117 +323,137 @@ class _DescobrirDispositivosThread(QThread):
                 f"Varredura concluída: {len(dispositivos)} dispositivo(s)."
             )
             self.varredura_concluida.emit(dispositivos)
+
         except Exception as e:
-            self.erro_ocorrido.emit(f"Erro na descoberta: {str(e)}")
+            self.erro_ocorrido.emit(f"Erro na descoberta: {e}")
 
     @staticmethod
     def _ip_util(ip: str) -> bool:
-        if not ip:
-            return False
         try:
-            partes = [int(p) for p in ip.split(".")]
-            if len(partes) != 4:
+            p = [int(x) for x in ip.split(".")]
+            if len(p) != 4:
                 return False
-            if partes[0] in (127, 0):
-                return False
-            if partes[0] == 169 and partes[1] == 254:
-                return False
-            if 224 <= partes[0] <= 239:
-                return False
-            if partes[3] == 255:
-                return False
-            return True
+            return not (
+                p[0] in (0, 127) or
+                (p[0] == 169 and p[1] == 254) or
+                224 <= p[0] <= 239 or
+                p[3] == 255
+            )
         except Exception:
             return False
 
     def _cidr_por_interface(self) -> str:
         try:
             from scapy.all import get_if_addr, get_if_netmask
-            ip_iface = get_if_addr(self.interface)
-            mascara  = get_if_netmask(self.interface)
-            if ip_iface and mascara:
-                bits = sum(bin(int(p)).count('1') for p in mascara.split('.'))
-                return f"{ip_iface}/{bits}"
+            ip   = get_if_addr(self.interface)
+            mask = get_if_netmask(self.interface)
+            if ip and mask:
+                bits = sum(bin(int(p)).count('1') for p in mask.split('.'))
+                return f"{ip}/{bits}"
         except Exception:
-            pass
+            return ""
         return ""
 
     @staticmethod
     def _cidr_por_ip_local() -> str:
-        ip_local = obter_ip_local()
-        if not ip_local or ip_local == "127.0.0.1":
+        ip = obter_ip_local()
+        if not ip or ip == "127.0.0.1":
             return ""
-        partes = ip_local.split('.')
-        if len(partes) == 4:
-            return f"{'.'.join(partes[:3])}.0/24"
-        return ""
+        partes = ip.split('.')
+        return f"{'.'.join(partes[:3])}.0/24" if len(partes) == 4 else ""
 
-# ============================================================================
-# JANELA PRINCIPAL
-# ============================================================================
+
+# ════════════════════════════════════════════════════════════════════════
+# Worker para processamento pedagógico em thread separada
+# ════════════════════════════════════════════════════════════════════════
+
+class WorkerPedagogico(QObject):
+    resultado_pronto = pyqtSignal(dict)
+    finished = pyqtSignal()
+
+    def __init__(self, evento, motor):
+        super().__init__()
+        self.evento = evento
+        self.motor = motor
+
+    def run(self):
+        try:
+            explicacao = self.motor.gerar_explicacao(self.evento)
+            if explicacao is None:
+                explicacao = {
+                    "nivel1": f"Evento: {self.evento.get('tipo', 'Desconhecido')}",
+                    "nivel2": f"Origem: {self.evento.get('ip_origem', '?')} → Destino: {self.evento.get('ip_destino', '?')}",
+                    "nivel3": f"Dados: {self.evento}",
+                    "icone": "🔍", "nivel": "INFO",
+                    "alerta": "Evento detectado.",
+                }
+            explicacao["sessao_id"] = self.evento.get("sessao_id")
+            self.resultado_pronto.emit(explicacao)
+        except Exception as e:
+            print(f"Erro no worker pedagógico: {e}")
+        finally:
+            self.finished.emit()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Janela principal
+# ════════════════════════════════════════════════════════════════════════
 
 class JanelaPrincipal(QMainWindow):
-    """Janela principal do NetLab Educacional — pipeline desacoplada v3.0."""
+    """Janela principal do NetLab Educacional — concorrência corrigida."""
 
     def __init__(self, banco: BancoDados):
         super().__init__()
         self.banco            = banco
+        self.analisador       = AnalisadorPacotes()
         self.motor_pedagogico = MotorPedagogico()
 
-        # Threads gerenciadas
-        self.capturador:   _CapturadorPacotesThread    = None
-        self.processador:  _ProcessadorThread          = None
-        self.descobridor:  _DescobrirDispositivosThread = None
+        # Thread de escrita assíncrona no banco (elimina travamentos SQLite)
+        self._escritor_banco = _EscritorBanco(banco)
+        self._escritor_banco.start()
+
+        self.capturador:  _CapturadorPacotesThread     = None
+        self.descobridor: _DescobrirDispositivosThread = None
         self.descoberta_rodando: bool = False
 
         self.sessao_id:  int  = None
         self.em_captura: bool = False
 
-        # Mapeamento interface
-        self._mapa_interface_nome    = {}
-        self._mapa_interface_ip      = {}
-        self._mapa_interface_mascara = {}
-        self._interface_captura      = ""
-        self._cidr_captura           = ""
+        self._mapa_interface_nome:    dict = {}
+        self._mapa_interface_ip:      dict = {}
+        self._mapa_interface_mascara: dict = {}
+        self._interface_captura = ""
+        self._cidr_captura      = ""
 
-        # Snapshot único — sempre atualizado pelo sinal snapshot_pronto
         self._snapshot_atual = {
-            "total_bytes":        0,
-            "total_pacotes":      0,
-            "estatisticas":       [],
-            "top_dispositivos":   [],
-            "dispositivos_ativos": 0,
-            "top_dns":            [],
-            "historias":          [],
+            "total_bytes": 0, "total_pacotes": 0,
+            "estatisticas": [], "top_dispositivos": [],
+            "dispositivos_ativos": 0, "top_dns": [], "historias": [],
         }
         self._bytes_total_anterior = 0
         self._instante_anterior    = time.perf_counter()
 
-        # Estado de cooldown e deduplicação
         self.estado_rede = EstadoRede()
-        # Buffer circular de eventos pendentes de exibição
-        self.fila_eventos_ui = deque(maxlen=500)
-        # Buffer circular de deduplicação visual
-        self.eventos_mostrados_recentemente = deque(maxlen=200)
+        self.fila_eventos_ui: deque = deque(maxlen=500)
+        self.eventos_mostrados_recentemente: deque = deque(maxlen=200)
 
-        # ── Timers da main thread ──────────────────────────────────────────
-        # Atualiza gráfico de throughput + labels de status (1 s)
+        # ── Timers ────────────────────────────────────────────────────
+        # _consumir_fila: apenas enfileira no analisador + coleta resultados
+        self.timer_consumir = QTimer()
+        self.timer_consumir.timeout.connect(self._consumir_fila)
+
+        # Atualização visual a 1 segundo
         self.timer_ui = QTimer()
         self.timer_ui.timeout.connect(self._atualizar_ui_por_segundo)
 
-        # Atualiza Insights (30 s) — intervalo baixo, sem re-renders desnecessários
-        self.timer_insights = QTimer()
-        self.timer_insights.setInterval(30_000)
-        self.timer_insights.timeout.connect(self._atualizar_insights_periodico)
-
-        # Descarrega eventos na lista visual (2 s)
-        self.timer_eventos = QTimer()
-        self.timer_eventos.timeout.connect(self._descarregar_eventos_ui)
-        self.timer_eventos.start(2_000)
-
-        # Varredura ARP periódica (30 s) — inicia junto com captura
+        # Varredura ARP periódica
         self.timer_descoberta = QTimer()
         self.timer_descoberta.timeout.connect(self._descoberta_periodica)
+
+        # Descarregar eventos pedagógicos a cada 2 segundos
+        self.timer_eventos = QTimer()
+        self.timer_eventos.timeout.connect(self._descarregar_eventos_ui)
+        self.timer_eventos.start(2000)
 
         self._configurar_janela()
         self._criar_menu()
@@ -567,9 +461,7 @@ class JanelaPrincipal(QMainWindow):
         self._criar_barra_ferramentas()
         self._criar_area_central()
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Configuração da janela e menus
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Configuração da janela ────────────────────────────────────────
 
     def _configurar_janela(self):
         self.setWindowTitle("NetLab Educacional - Monitor de Rede")
@@ -584,24 +476,24 @@ class JanelaPrincipal(QMainWindow):
     def _criar_menu(self):
         menu = self.menuBar()
 
-        m_arq   = menu.addMenu("&Arquivo")
-        a_nova  = QAction("&Nova Sessão", self)
+        m_arq = menu.addMenu("&Arquivo")
+        a_nova = QAction("&Nova Sessão", self)
         a_nova.setShortcut("Ctrl+N")
         a_nova.triggered.connect(self._nova_sessao)
         m_arq.addAction(a_nova)
         m_arq.addSeparator()
-        a_sair  = QAction("&Sair", self)
+        a_sair = QAction("&Sair", self)
         a_sair.setShortcut("Ctrl+Q")
         a_sair.triggered.connect(self.close)
         m_arq.addAction(a_sair)
 
-        m_mon   = menu.addMenu("&Monitoramento")
+        m_mon = menu.addMenu("&Monitoramento")
         self.acao_captura = QAction("Iniciar Captura", self)
         self.acao_captura.setShortcut("F5")
         self.acao_captura.triggered.connect(self._alternar_captura)
         m_mon.addAction(self.acao_captura)
 
-        m_ajd   = menu.addMenu("&Ajuda")
+        m_ajd = menu.addMenu("&Ajuda")
         a_sobre = QAction("Sobre o NetLab", self)
         a_sobre.triggered.connect(self._exibir_sobre)
         m_ajd.addAction(a_sobre)
@@ -613,10 +505,6 @@ class JanelaPrincipal(QMainWindow):
         barra.addWidget(QLabel("  Interface: "))
         self.combo_interface = QComboBox()
         self.combo_interface.setMinimumWidth(230)
-        self.combo_interface.setToolTip(
-            "Interface de rede a ser monitorada.\n"
-            "A interface ativa é selecionada automaticamente."
-        )
         self._popular_interfaces()
         barra.addWidget(self.combo_interface)
         barra.addSeparator()
@@ -647,7 +535,7 @@ class JanelaPrincipal(QMainWindow):
         self.painel_servidor  = PainelServidor()
 
         self.abas.addTab(self.painel_topologia, "Topologia da Rede")
-        self.abas.addTab(self.painel_trafego,   "Trafego em Tempo Real")
+        self.abas.addTab(self.painel_trafego,   "Tráfego em Tempo Real")
         self.abas.addTab(self.painel_eventos,   " Modo Análise")
         self.abas.addTab(self.painel_servidor,  "Servidor")
 
@@ -660,9 +548,7 @@ class JanelaPrincipal(QMainWindow):
         b.addPermanentWidget(self.lbl_pacotes)
         b.addPermanentWidget(self.lbl_dados)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Detecção de interfaces
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Detecção de interfaces ────────────────────────────────────────
 
     def _popular_interfaces(self):
         self.combo_interface.clear()
@@ -693,13 +579,11 @@ class JanelaPrincipal(QMainWindow):
 
             ips     = iface.get('ips', []) or []
             mascaras = iface.get('netmasks', []) or []
-            ip_v4   = next(
-                (ip for ip in ips
-                 if ip and ip.count('.') == 3
-                 and not ip.startswith("169.254")
-                 and not ip.startswith("127.")),
-                ""
-            )
+            ip_v4 = next((
+                ip for ip in ips
+                if ip and ip.count('.') == 3
+                and not ip.startswith(("169.254", "127."))
+            ), "")
             if ip_v4:
                 self._mapa_interface_ip[desc] = ip_v4
                 try:
@@ -709,21 +593,20 @@ class JanelaPrincipal(QMainWindow):
                 except Exception:
                     pass
             if desc not in self._mapa_interface_mascara:
-                mascara_unitaria = iface.get('netmask')
-                if mascara_unitaria:
-                    self._mapa_interface_mascara[desc] = mascara_unitaria
+                mask = iface.get('netmask')
+                if mask:
+                    self._mapa_interface_mascara[desc] = mask
 
         ip_local = obter_ip_local()
         if ip_local:
             for iface in interfaces_raw:
-                if ip_local in (iface.get('ips') or []):
+                if ip_local in (iface.get('ips', []) or []):
                     desc = iface.get('description', iface.get('name', ''))
-                    if desc:
-                        idx = self.combo_interface.findText(desc)
-                        if idx >= 0:
-                            self.combo_interface.setCurrentIndex(idx)
-                            self._status(f"Interface ativa detectada: {desc}")
-                            return
+                    idx  = self.combo_interface.findText(desc)
+                    if idx >= 0:
+                        self.combo_interface.setCurrentIndex(idx)
+                        self._status(f"Interface ativa detectada: {desc}")
+                        return
 
         if self.combo_interface.count() > 0:
             self.combo_interface.setCurrentIndex(0)
@@ -731,18 +614,9 @@ class JanelaPrincipal(QMainWindow):
     def _selecionar_interface_fallback(self):
         try:
             from scapy.all import conf
-            default_iface = str(conf.iface)
+            default = str(conf.iface)
             for i in range(self.combo_interface.count()):
-                if default_iface in self.combo_interface.itemText(i):
-                    self.combo_interface.setCurrentIndex(i)
-                    return
-        except Exception:
-            pass
-        try:
-            ip_local    = obter_ip_local()
-            ultimo_octeto = ip_local.split(".")[-1] if ip_local else ""
-            for i in range(self.combo_interface.count()):
-                if ultimo_octeto and ultimo_octeto in self.combo_interface.itemText(i):
+                if default in self.combo_interface.itemText(i):
                     self.combo_interface.setCurrentIndex(i)
                     return
         except Exception:
@@ -755,19 +629,22 @@ class JanelaPrincipal(QMainWindow):
         except Exception:
             return 24
 
-    def _cidr_da_interface(self, descricao_iface: str) -> str:
-        ip_iface = self._mapa_interface_ip.get(descricao_iface)
-        mascara  = self._mapa_interface_mascara.get(descricao_iface, "")
-        if not ip_iface:
+    def _cidr_da_interface(self, desc: str) -> str:
+        ip   = self._mapa_interface_ip.get(desc, "")
+        mask = self._mapa_interface_mascara.get(desc, "")
+        if not ip:
             return ""
-        if mascara:
-            prefixo = self._mascara_para_prefixo(mascara)
-            return f"{ip_iface}/{prefixo}"
-        return f"{ip_iface}/24"
+        prefixo = self._mascara_para_prefixo(mask) if mask else 24
+        return f"{ip}/{prefixo}"
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Controle de captura
-    # ──────────────────────────────────────────────────────────────────────
+    def _gerar_historias(self) -> list:
+        top_dns = self.analisador.obter_top_dns() if hasattr(self.analisador, "obter_top_dns") else []
+        return [
+            f"Domínio {d['dominio']} acessado {d['acessos']}x ({d['bytes']/1024:.1f} KB)."
+            for d in top_dns[:5]
+        ]
+
+    # ── Controle de captura ───────────────────────────────────────────
 
     @pyqtSlot()
     def _alternar_captura(self):
@@ -781,36 +658,34 @@ class JanelaPrincipal(QMainWindow):
             import ctypes
             if hasattr(ctypes, "windll") and not ctypes.windll.shell32.IsUserAnAdmin():
                 raise PermissionError(
-                    "Execute o NetLab como Administrador para que o Npcap "
-                    "permita a captura de pacotes."
+                    "Execute o NetLab como Administrador para capturar pacotes."
                 )
+        except PermissionError:
+            raise
         except Exception:
             pass
+
         try:
             from scapy.arch.windows import get_windows_if_list
-            adaptadores   = get_windows_if_list()
-            nomes_validos = (
-                {a.get("name") for a in adaptadores}
-                | {a.get("description") for a in adaptadores}
-            )
+            adaptadores = get_windows_if_list()
+            nomes_validos = {
+                a.get("name") for a in adaptadores
+            } | {a.get("description") for a in adaptadores}
             if nome_dispositivo not in nomes_validos:
                 raise RuntimeError(
                     "Adaptador não reconhecido pelo Npcap/Scapy. "
                     "Reinstale o Npcap ou escolha outra interface."
                 )
         except ImportError as exc:
-            raise RuntimeError(
-                "Biblioteca Scapy ausente. "
-                "Instale-a com 'pip install scapy'."
-            ) from exc
+            raise RuntimeError("Scapy ausente. Instale com 'pip install scapy'.") from exc
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(f"Falha ao acessar o Npcap/Scapy: {exc}") from exc
 
     def _limpar_pos_falha(self):
+        self.timer_consumir.stop()
         self.timer_ui.stop()
-        self.timer_insights.stop()
         self.timer_descoberta.stop()
         if self.capturador:
             try:
@@ -818,49 +693,41 @@ class JanelaPrincipal(QMainWindow):
             except Exception:
                 pass
             self.capturador = None
-        if self.processador and self.processador.isRunning():
-            try:
-                self.processador.parar()
-            except Exception:
-                pass
+        self.analisador.parar_thread()
         self._interface_captura = ""
         self._cidr_captura      = ""
-        self.em_captura         = False
+        self.em_captura = False
         self.botao_captura.setText("Iniciar Captura")
         self.botao_captura.setObjectName("botao_captura")
         self._repolir(self.botao_captura)
         self.acao_captura.setText("Iniciar Captura")
 
     def _iniciar_captura(self):
-        descricao_selecionada = self.combo_interface.currentText()
-        if not descricao_selecionada or "nenhuma" in descricao_selecionada.lower():
+        desc_sel = self.combo_interface.currentText()
+        if not desc_sel or "nenhuma" in desc_sel.lower():
             QMessageBox.warning(
                 self, "Interface Inválida",
                 "Selecione uma interface de rede válida.\n\n"
-                "Execute o programa como Administrador e verifique a instalação do Npcap."
+                "Execute como Administrador e verifique a instalação do Npcap."
             )
             return
 
-        nome_dispositivo = self._mapa_interface_nome.get(descricao_selecionada,
-                                                         descricao_selecionada)
+        nome_dispositivo = self._mapa_interface_nome.get(desc_sel, desc_sel)
+
         try:
             self._validar_pre_captura(nome_dispositivo)
         except Exception as exc:
-            mensagem = str(exc)
-            self._status(f"Falha ao iniciar: {mensagem}")
-            QMessageBox.critical(self, "Captura não iniciada", mensagem)
+            self._status(f"Falha ao iniciar: {exc}")
+            QMessageBox.critical(self, "Captura não iniciada", str(exc))
             self._limpar_pos_falha()
             return
 
         self._interface_captura = nome_dispositivo
-        self._cidr_captura      = self._cidr_da_interface(descricao_selecionada)
+        self._cidr_captura      = self._cidr_da_interface(desc_sel)
         self.painel_topologia.definir_rede_local(self._cidr_captura)
 
-        # Limpa buffers e estado
         fila_pacotes_global.limpar()
-        self.estado_rede.resetar()
-        self.fila_eventos_ui.clear()
-        self.eventos_mostrados_recentemente.clear()
+        self.analisador.resetar()
         self._snapshot_atual = {
             "total_bytes": 0, "total_pacotes": 0,
             "estatisticas": [], "top_dispositivos": [],
@@ -870,69 +737,60 @@ class JanelaPrincipal(QMainWindow):
         self._instante_anterior    = time.perf_counter()
         self.sessao_id             = self.banco.iniciar_sessao()
 
-        # Inicia thread de processamento
-        self.processador = _ProcessadorThread()
-        self.processador.resetar()
-        self.processador.snapshot_pronto.connect(self._ao_receber_snapshot)
-        self.processador.batch_conexoes.connect(self._ao_receber_conexoes)
-        self.processador.batch_eventos.connect(self._ao_receber_eventos)
-        self.processador.batch_banco.connect(self._ao_salvar_banco)
+        # Inicia thread de análise assíncrona
+        self.analisador.iniciar_thread()
 
-        # Inicia thread de captura
         try:
             self.capturador = _CapturadorPacotesThread(interface=nome_dispositivo)
             self.capturador.erro_ocorrido.connect(self._ao_ocorrer_erro)
             self.capturador.sem_pacotes.connect(self._ao_ocorrer_erro)
             self.capturador.start()
         except Exception as exc:
-            mensagem = f"Não foi possível iniciar o sniffer: {exc}"
-            self._status(mensagem)
-            QMessageBox.critical(self, "Captura não iniciada", mensagem)
+            msg = f"Não foi possível iniciar o sniffer: {exc}"
+            self._status(msg)
+            QMessageBox.critical(self, "Captura não iniciada", msg)
             self._limpar_pos_falha()
             return
 
-        # Inicia thread de processamento após sniffer ativo
-        self.processador.start()
-
-        # Ativa timers de UI
-        self.timer_ui.start(1_000)
-        self.timer_insights.start()
-        self.timer_descoberta.start(30_000)
+        self.timer_consumir.start(250)
+        self.timer_ui.start(1500)
+        self.timer_descoberta.start(30000)
 
         self.em_captura = True
         self.botao_captura.setText("Parar Captura")
         self.botao_captura.setObjectName("botao_parar")
         self._repolir(self.botao_captura)
         self.acao_captura.setText("Parar Captura")
+
         rede_info = f" · rede {self._cidr_captura}" if self._cidr_captura else ""
         self._status(
-            f"Capturando em: {descricao_selecionada} "
-            f"(dispositivo: {nome_dispositivo}){rede_info}"
+            f"Capturando em: {desc_sel} (dispositivo: {nome_dispositivo}){rede_info}"
         )
 
     def _parar_captura(self):
-        # Para timers antes das threads para evitar callbacks durante shutdown
+        self.timer_consumir.stop()
         self.timer_ui.stop()
-        self.timer_insights.stop()
         self.timer_descoberta.stop()
 
-        # Para captura de pacotes
         if self.capturador:
             self.capturador.parar()
             self.capturador = None
 
-        # Para processamento e aguarda flush final
-        if self.processador and self.processador.isRunning():
-            self.processador.parar()
+        # Para thread de análise e coleta resultados finais
+        self.analisador.parar_thread()
+        self._consumir_fila()
 
-        # Salva sessão com totais finais
-        if self.sessao_id and self.processador:
-            total_pacotes, total_bytes = self.processador.obter_totais()
-            self.banco.finalizar_sessao(self.sessao_id, total_pacotes, total_bytes)
+        if self.sessao_id:
+            self._escritor_banco.enfileirar(
+                self.banco.finalizar_sessao,
+                (self.sessao_id,
+                 self.analisador.total_pacotes,
+                 self.analisador.total_bytes),
+            )
 
         self._interface_captura = ""
         self._cidr_captura      = ""
-        self.em_captura         = False
+        self.em_captura = False
         self.botao_captura.setText("Iniciar Captura")
         self.botao_captura.setObjectName("botao_captura")
         self._repolir(self.botao_captura)
@@ -944,68 +802,131 @@ class JanelaPrincipal(QMainWindow):
         botao.style().unpolish(botao)
         botao.style().polish(botao)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Receptores de sinais do ProcessadorThread
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Consumo da fila (UI thread — trabalho MÍNIMO) ─────────────────
+    #
+    # Esta função roda a cada 100 ms na UI thread.
+    # NUNCA deve fazer: parsing de pacotes, commits SQLite ou I/O.
+    # Apenas:
+    #   1. Passa pacotes ao analisador (enfileirar — O(1))
+    #   2. Coleta eventos prontos (coletar_resultados — O(n eventos))
+    #   3. Atualiza topologia (só IPs, sem banco)
+    #   4. Roteia DB para _EscritorBanco (O(1) — sem bloqueio)
 
-    @pyqtSlot(dict)
-    def _ao_receber_snapshot(self, snap: dict):
-        """Atualiza o snapshot atual com os dados processados na thread."""
-        snap["historias"] = self._gerar_historias_de(snap.get("top_dns", []))
-        self._snapshot_atual = snap
+    @pyqtSlot()
+    def _consumir_fila(self):
+        # 1. Pega todos os pacotes brutos da fila do sniffer
+        pacotes = fila_pacotes_global.consumir_todos()
+        for dados in pacotes:
+            self.analisador.enfileirar(dados)
 
-    @pyqtSlot(list)
-    def _ao_receber_conexoes(self, conexoes: list):
-        """Atualiza topologia e banco com pares (ip_src, ip_dst, mac_src)."""
-        for ip_origem, ip_destino, mac_origem in conexoes:
+        # 2. Coleta eventos já analisados pela ThreadAnalisador
+        eventos, _ = self.analisador.coletar_resultados()
+
+        for evento in eventos:
+            ip_origem  = evento.get("ip_origem",  "")
+            ip_destino = evento.get("ip_destino", "")
+            mac_origem = evento.get("mac_origem", "")
+            tipo       = evento.get("tipo",       "")
+
+            # Atualiza topologia (operação Qt — rápida, sem I/O)
             if ip_origem:
                 self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
-                self.banco.salvar_dispositivo(ip_origem, mac_origem)
             if ip_origem and ip_destino:
                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
 
-    @pyqtSlot(list)
-    def _ao_receber_eventos(self, eventos: list):
-        """Aplica cooldown e enfileira eventos para exibição na UI."""
-        for evento in eventos:
-            if evento["tipo"] == "NOVO_DISPOSITIVO":
-                ip = evento.get("ip_origem")
-                if ip:
-                    status = self.estado_rede.registrar_dispositivo(
-                        ip, evento.get("mac_origem", "")
-                    )
-                    if (status == "NOVO"
-                            and self.estado_rede.deve_emitir_evento(
-                                f"novo_{ip}", cooldown=30)):
-                        self.fila_eventos_ui.append(evento)
-            else:
-                _disc = (
-                    evento.get("dominio", "")
-                    or f"{evento.get('metodo', '')}:{evento.get('recurso', '')}"
+            # Salva dispositivo no banco em background
+            if ip_origem:
+                self._escritor_banco.enfileirar(
+                    self.banco.salvar_dispositivo,
+                    (ip_origem, mac_origem),
                 )
-                chave = f"{evento['tipo']}_{evento.get('ip_origem')}_{_disc}"
-                if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
-                    self.fila_eventos_ui.append(evento)
 
-    @pyqtSlot(list)
-    def _ao_salvar_banco(self, pacotes: list):
-        """Persiste lote de pacotes no banco de dados (main thread)."""
-        for dados in pacotes:
-            self.banco.salvar_pacote(
-                ip_origem     = dados.get("ip_origem",    ""),
-                ip_destino    = dados.get("ip_destino",   ""),
-                mac_origem    = dados.get("mac_origem",   ""),
-                mac_destino   = dados.get("mac_destino",  ""),
-                protocolo     = dados.get("protocolo",    ""),
-                tamanho_bytes = dados.get("tamanho",      0),
-                porta_origem  = dados.get("porta_origem"),
-                porta_destino = dados.get("porta_destino"),
-                sessao_id     = self.sessao_id,
+            # Filtragem e enfileiramento de eventos pedagógicos
+            if tipo:
+                if tipo == "NOVO_DISPOSITIVO":
+                    if ip_origem:
+                        status = self.estado_rede.registrar_dispositivo(ip_origem, mac_origem)
+                        if status == "NOVO" and self.estado_rede.deve_emitir_evento(
+                            f"novo_{ip_origem}", cooldown=30
+                        ):
+                            self.fila_eventos_ui.append(evento)
+                else:
+                    _disc = (
+                        evento.get("dominio", "")
+                        or f"{evento.get('metodo', '')}:{evento.get('recurso', '')}"
+                    )
+                    chave = f"{tipo}_{ip_origem}_{_disc}"
+                    
+                    # NOVO: DNS não tem cooldown (permitir todas as consultas)
+                    if tipo == "DNS":
+                        self.fila_eventos_ui.append(evento)
+                    else:
+                        if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
+                            self.fila_eventos_ui.append(evento)
+
+        # 3. Amostragem para banco (1 em cada 5 pacotes — em background)
+        if pacotes:
+            for i, dados in enumerate(pacotes):
+                if i % 5 == 0:
+                    self._escritor_banco.enfileirar(
+                        self.banco.salvar_pacote,
+                        (
+                            dados.get("ip_origem",    ""),
+                            dados.get("ip_destino",   ""),
+                            dados.get("mac_origem",   ""),
+                            dados.get("mac_destino",  ""),
+                            dados.get("protocolo",    ""),
+                            dados.get("tamanho",      0),
+                            dados.get("porta_origem"),
+                            dados.get("porta_destino"),
+                            self.sessao_id,
+                        ),
+                    )
+
+        # 4. Atualiza snapshot em memória (sem I/O)
+        self._snapshot_atual = {
+            "total_bytes":       self.analisador.total_bytes,
+            "total_pacotes":     self.analisador.total_pacotes,
+            "estatisticas":      self.analisador.obter_estatisticas_protocolos(),
+            "top_dispositivos":  self.analisador.obter_top_dispositivos(),
+            "dispositivos_ativos": len(self.analisador.trafego_dispositivos),
+            "top_dns":           self.analisador.obter_top_dns(),
+            "historias":         self._gerar_historias(),
+        }
+
+    # ── Agregação e descarregamento de eventos pedagógicos ────────────
+
+    def _agregar_eventos(self, eventos: list) -> list:
+        agregados: dict = {}
+        for ev in eventos:
+            chave = (ev.get("tipo"), ev.get("ip_origem"), ev.get("dominio", ""))
+            if chave not in agregados:
+                agregados[chave] = {**ev, "contagem": 1}
+            else:
+                agregados[chave]["contagem"] += 1
+        return list(agregados.values())
+
+    @pyqtSlot()
+    def _descarregar_eventos_ui(self):
+        if not self.fila_eventos_ui:
+            return
+        lote = list(self.fila_eventos_ui)
+        self.fila_eventos_ui.clear()
+        for ev in self._agregar_eventos(lote):
+            _disc_visual = (
+                ev.get("dominio", "")
+                or f"{ev.get('metodo', '')}:{ev.get('recurso', '')}"
             )
+            chave_visual = (
+                ev.get("tipo"), ev.get("ip_origem"),
+                ev.get("ip_destino"), _disc_visual,
+            )
+            if chave_visual in self.eventos_mostrados_recentemente:
+                continue
+            self.eventos_mostrados_recentemente.append(chave_visual)
+            self._exibir_evento_pedagogico(ev)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Atualização da UI (1 segundo) — apenas gráfico + status bar
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Atualização da UI a 1 segundo ────────────────────────────────
 
     @pyqtSlot()
     def _atualizar_ui_por_segundo(self):
@@ -1013,24 +934,28 @@ class JanelaPrincipal(QMainWindow):
         total_bytes   = snap.get("total_bytes",   0)
         total_pacotes = snap.get("total_pacotes", 0)
 
-        agora         = time.perf_counter()
-        delta_t       = max(agora - self._instante_anterior, 0.001)
-        delta_bytes   = total_bytes - self._bytes_total_anterior
-        kb_por_segundo = (delta_bytes / 1024.0) / delta_t
+        agora     = time.perf_counter()
+        delta_t   = max(agora - self._instante_anterior, 0.001)
+        delta_b   = total_bytes - self._bytes_total_anterior
+        kb_por_s  = (delta_b / 1024.0) / delta_t
 
         self._bytes_total_anterior = total_bytes
         self._instante_anterior    = agora
 
-        self.painel_trafego.adicionar_ponto_grafico(kb_por_segundo)
+        self.painel_trafego.adicionar_ponto_grafico(kb_por_s)
         self.painel_trafego.atualizar_tabelas(
-            estatisticas_protocolos = snap.get("estatisticas",     []),
-            top_dispositivos        = snap.get("top_dispositivos", []),
-            total_pacotes           = total_pacotes,
-            total_bytes             = total_bytes,
-            total_topologia         = self.painel_topologia.total_dispositivos(),
-            total_ativos            = self.painel_topologia.total_dispositivos(),
+            estatisticas_protocolos=snap.get("estatisticas", []),
+            top_dispositivos       =snap.get("top_dispositivos", []),
+            total_pacotes          =total_pacotes,
+            total_bytes            =total_bytes,
+            total_topologia        =self.painel_topologia.total_dispositivos(),
+            total_ativos           =self.painel_topologia.total_dispositivos(),
         )
         self.painel_topologia.atualizar()
+        self.painel_eventos.atualizar_insights(
+            snap.get("top_dns",   []),
+            snap.get("historias", []),
+        )
 
         kb = total_bytes / 1024
         self.lbl_pacotes.setText(f"Pacotes: {total_pacotes:,}")
@@ -1039,106 +964,68 @@ class JanelaPrincipal(QMainWindow):
             else f"  Dados: {kb:.1f} KB  "
         )
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Atualização de Insights (30 segundos) — apenas passa dados; render
-    # está dentro do PainelEventos com seu próprio timer de diff.
-    # ──────────────────────────────────────────────────────────────────────
-
-    @pyqtSlot()
-    def _atualizar_insights_periodico(self):
-        snap = self._snapshot_atual
-        self.painel_eventos.atualizar_insights(
-            top_dns          = snap.get("top_dns",          []),
-            historias        = snap.get("historias",        []),
-            top_dispositivos = snap.get("top_dispositivos", []),
-        )
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Descarregamento de eventos na UI (2 segundos)
-    # ──────────────────────────────────────────────────────────────────────
-
-    @pyqtSlot()
-    def _descarregar_eventos_ui(self):
-        if not self.fila_eventos_ui:
-            return
-        # Drena atomicamente o deque para processamento
-        lote = []
-        while self.fila_eventos_ui:
-            try:
-                lote.append(self.fila_eventos_ui.popleft())
-            except IndexError:
-                break
-
-        agregados = self._agregar_eventos(lote)
-        for ev in agregados:
-            _disc_visual = (
-                ev.get("dominio", "")
-                or f"{ev.get('metodo', '')}:{ev.get('recurso', '')}"
-            )
-            chave_visual = (
-                ev.get("tipo"), ev.get("ip_origem"),
-                ev.get("ip_destino"), _disc_visual
-            )
-            if chave_visual in self.eventos_mostrados_recentemente:
-                continue
-            self.eventos_mostrados_recentemente.append(chave_visual)
-            self._exibir_evento_pedagogico(ev)
-
-    @staticmethod
-    def _agregar_eventos(eventos: list) -> list:
-        agregados = {}
-        for ev in eventos:
-            chave = (ev.get("tipo"), ev.get("ip_origem"), ev.get("dominio", ""))
-            if chave not in agregados:
-                agregados[chave] = ev.copy()
-                agregados[chave]["contagem"] = 1
-            else:
-                agregados[chave]["contagem"] += 1
-        return list(agregados.values())
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Exibição de evento pedagógico
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Exibição de evento pedagógico ─────────────────────────────────
 
     def _exibir_evento_pedagogico(self, evento: dict):
         evento["sessao_id"] = self.sessao_id
-        explicacao = self.motor_pedagogico.gerar_explicacao(evento)
-        if explicacao is None:
-            explicacao = {
-                "nivel1": f"Evento: {evento.get('tipo', 'Desconhecido')}",
-                "nivel2": f"Origem: {evento.get('ip_origem', '?')} → Destino: {evento.get('ip_destino', '?')}",
-                "nivel3": f"Dados: {evento}",
-                "icone":  "🔍",
-                "nivel":  "INFO",
-                "alerta": "Evento detectado.",
-            }
-        explicacao["sessao_id"] = self.sessao_id
+        
+        # Cria thread e worker
+        self.worker_thread = QThread()
+        self.worker = WorkerPedagogico(evento, self.motor_pedagogico)
+        self.worker.moveToThread(self.worker_thread)
+        
+        # Conecta sinais
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.resultado_pronto.connect(self._finalizar_exibicao_evento)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        
+        # Armazena para limpeza posterior
+        if not hasattr(self, '_worker_threads'):
+            self._worker_threads = []
+        self._worker_threads.append(self.worker_thread)
+        
+        self.worker_thread.start()
+
+    def _finalizar_exibicao_evento(self, explicacao: dict):
         self.painel_eventos.adicionar_evento(explicacao)
-        self.banco.salvar_evento(
-            tipo_evento  = evento.get("tipo", ""),
-            descricao    = explicacao.get("nivel1", "")[:500],
-            ip_envolvido = evento.get("ip_origem"),
-            sessao_id    = self.sessao_id,
+        self._escritor_banco.enfileirar(
+            self.banco.salvar_evento,
+            (
+                explicacao.get("tipo", ""),
+                explicacao.get("nivel1", "")[:500],
+                explicacao.get("ip_envolvido", ""),
+                self.sessao_id,
+            ),
         )
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Descoberta periódica de dispositivos
-    # ──────────────────────────────────────────────────────────────────────
+    def _finalizar_workers(self):
+        if not hasattr(self, '_worker_threads'):
+            return
+        for thread in self._worker_threads:
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(2000):
+                    thread.terminate()
+                    thread.wait()
+            thread.deleteLater()
+        self._worker_threads.clear()
+
+    # ── Descoberta periódica de dispositivos ──────────────────────────
 
     def _descoberta_periodica(self):
         if not self.em_captura:
             return
         if self.descoberta_rodando or (self.descobridor and self.descobridor.isRunning()):
             return
+        if not self._interface_captura:
+            return
         self.descoberta_rodando = True
         self._status("Varrendo a rede local em busca de dispositivos...")
-        if not self._interface_captura:
-            self.descoberta_rodando = False
-            return
         self.descobridor = _DescobrirDispositivosThread(
-            interface     = self._interface_captura,
-            cidr          = self._cidr_captura,
-            habilitar_ping = True,
+            interface=self._interface_captura,
+            cidr=self._cidr_captura,
         )
         self.descobridor.dispositivo_encontrado.connect(self._ao_encontrar_dispositivo)
         self.descobridor.varredura_concluida.connect(self._ao_concluir_varredura)
@@ -1149,36 +1036,21 @@ class JanelaPrincipal(QMainWindow):
     @pyqtSlot(str, str, str)
     def _ao_encontrar_dispositivo(self, ip: str, mac: str, hostname: str):
         self.painel_topologia.adicionar_dispositivo_manual(ip, mac, hostname)
-        self.banco.salvar_dispositivo(ip, mac, hostname)
-        evento = {
-            "tipo":       "NOVO_DISPOSITIVO",
-            "ip_origem":  ip,
-            "ip_destino": "",
-            "mac_origem": mac,
-            "protocolo":  "ARP/DHCP",
-            "tamanho":    0,
-        }
-        self.fila_eventos_ui.append(evento)
+        self._escritor_banco.enfileirar(
+            self.banco.salvar_dispositivo, (ip, mac, hostname)
+        )
+        self.fila_eventos_ui.append({
+            "tipo": "NOVO_DISPOSITIVO", "ip_origem": ip,
+            "ip_destino": "", "mac_origem": mac,
+            "protocolo": "ARP/DHCP", "tamanho": 0,
+        })
 
     @pyqtSlot(list)
     def _ao_concluir_varredura(self, dispositivos: list):
-        self._status(f"Varredura concluída — {len(dispositivos)} dispositivo(s).")
+        self._status(f"Varredura concluída — {len(dispositivos)} dispositivo(s) encontrado(s).")
         self.descoberta_rodando = False
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Auxiliares
-    # ──────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _gerar_historias_de(top_dns: list) -> list:
-        historias = []
-        for dom in top_dns[:5]:
-            hist = (
-                f"Domínio {dom['dominio']} acessado {dom['acessos']}x "
-                f"({dom['bytes']/1024:.1f} KB via DNS/SNI)."
-            )
-            historias.append(hist)
-        return historias
+    # ── Tratamento de erros ───────────────────────────────────────────
 
     @pyqtSlot(str)
     def _ao_ocorrer_erro(self, mensagem: str):
@@ -1188,12 +1060,13 @@ class JanelaPrincipal(QMainWindow):
             self._parar_captura()
         self.descoberta_rodando = False
 
+    # ── Ações gerais ──────────────────────────────────────────────────
+
     def _nova_sessao(self):
+        self._finalizar_workers()
         if self.em_captura:
             self._parar_captura()
-        if self.processador:
-            self.processador.resetar()
-        self.estado_rede.resetar()
+        self.analisador.resetar()
         self.painel_topologia.limpar()
         self.painel_topologia.definir_rede_local(self._cidr_captura)
         self.painel_trafego.limpar()
@@ -1201,7 +1074,7 @@ class JanelaPrincipal(QMainWindow):
         self._snapshot_atual = {
             "total_bytes": 0, "total_pacotes": 0,
             "estatisticas": [], "top_dispositivos": [],
-            "dispositivos_ativos": 0, "top_dns": [], "historias": [],
+            "dispositivos_ativos": 0,
         }
         self._bytes_total_anterior = 0
         self._instante_anterior    = time.perf_counter()
@@ -1213,16 +1086,17 @@ class JanelaPrincipal(QMainWindow):
     def _exibir_sobre(self):
         QMessageBox.about(
             self, "Sobre o NetLab Educacional",
-            "<h2>NetLab Educacional v3.0</h2>"
+            "<h2>NetLab Educacional v2.1</h2>"
             "<p>Software educacional para análise de redes locais.</p>"
             "<hr>"
             "<p><b>TCC — Curso Técnico em Informática</b></p>"
             "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · SQLite · PyQtGraph</p>"
-            "<p><b>Pipeline desacoplada:</b> Captura → ProcessadorThread → UI</p>"
         )
 
     def closeEvent(self, evento):
+        self._finalizar_workers()
         if self.em_captura:
             self._parar_captura()
+        self._escritor_banco.parar()
         self.banco.fechar()
         evento.accept()
