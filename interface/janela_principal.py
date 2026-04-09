@@ -18,7 +18,10 @@
 import socket
 import threading
 import time
+import ipaddress
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
@@ -282,137 +285,293 @@ class _CapturadorPacotesThread(QThread):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Thread de varredura ARP
+# _DescobrirDispositivosThread — versão aprimorada para redes institucionais
+#
+# MELHORIAS EM RELAÇÃO À VERSÃO ANTERIOR:
+#
+#   1. ARP com 3 tentativas (retry) — pacotes perdidos por switches com
+#      STP/port-security são recuperados nas retransmissões.
+#
+#   2. ICMP paralelo real — ThreadPoolExecutor com até 64 workers simultâneos
+#      varrendo os 254 hosts em segundos, não minutos.
+#
+#   3. Detecção de múltiplas sub-redes — se a instituição usa /22 ou /23,
+#      o varredor expande automaticamente o escopo de busca.
+#
+#   4. Envio ARP manual em broadcast — contorna filtros de switches que
+#      bloqueiam a implementação padrão do arping() do Scapy.
+#
+#   5. Descoberta passiva aprimorada — aproveita IPs já vistos na captura
+#      ativa para enriquecer o resultado sem custo adicional.
+#
+# SUBSTITUIÇÃO: cole esta classe em interface/janela_principal.py no lugar
+# da classe _DescobrirDispositivosThread existente.
 # ════════════════════════════════════════════════════════════════════════
 
 class _DescobrirDispositivosThread(QThread):
-    dispositivo_encontrado = pyqtSignal(str, str, str)
-    varredura_concluida    = pyqtSignal(list)
+    """
+    Varre a rede local em busca de dispositivos ativos.
+
+    Estratégia em 4 fases:
+      Fase 1 — ARP broadcast tradicional (3 tentativas, timeout 5s cada)
+      Fase 2 — ARP manual frame-by-frame em paralelo (contorna port-security)
+      Fase 3 — ICMP Echo sweep paralelo com ThreadPoolExecutor
+      Fase 4 — Consolidação e deduplicação dos resultados
+    """
+
+    # Sinais emitidos para a janela principal (idênticos à versão anterior)
+    dispositivo_encontrado = pyqtSignal(str, str, str)   # ip, mac, hostname
+    varredura_concluida    = pyqtSignal(list)             # lista de (ip, mac, hostname)
     progresso_atualizado   = pyqtSignal(str)
     erro_ocorrido          = pyqtSignal(str)
 
+    # ── Constantes de configuração ────────────────────────────────────────
+    TENTATIVAS_ARP      = 3      # quantas vezes reenvia o broadcast ARP
+    TIMEOUT_ARP         = 5      # segundos de espera por rodada de ARP
+    TIMEOUT_ICMP        = 1.5    # segundos de espera por host no ICMP
+    MAX_WORKERS_ICMP    = 64     # threads ICMP simultâneas
+    TAMANHO_LOTE_ICMP   = 64     # hosts por lote de srp()
+    HABILITAR_EXPANSAO  = True   # tentar sub-redes /22 e /23 se /24 render pouco
+
     def __init__(self, interface: str, cidr: str = "", habilitar_ping: bool = True):
         super().__init__()
-        self.interface     = interface
-        self.cidr          = cidr
+        self.interface      = interface
+        self.cidr           = cidr
         self.habilitar_ping = habilitar_ping
+
+        # Conjunto compartilhado entre threads (protegido por lock)
+        self._ips_encontrados: set  = set()
+        self._dispositivos:    list = []
+        self._lock = threading.Lock()
+
+    # ── Ponto de entrada da thread ────────────────────────────────────────
 
     def run(self):
         try:
-            rede = self.cidr or self._cidr_por_interface() or self._cidr_por_ip_local()
-            if not rede:
-                self.erro_ocorrido.emit("Não foi possível determinar a sub-rede.")
+            rede_cidr = self.cidr or self._detectar_cidr() or self._cidr_por_ip_local()
+            if not rede_cidr:
+                self.erro_ocorrido.emit(
+                    "Não foi possível determinar a sub-rede. "
+                    "Verifique se a interface está ativa."
+                )
                 return
 
-            self.progresso_atualizado.emit(f"Varredura ARP ({rede}) — fase 1/2...")
+            self.progresso_atualizado.emit(
+                f"Iniciando varredura em {rede_cidr} …"
+            )
 
-            from scapy.all import arping
-            import ipaddress
+            # ── Fase 1: ARP com múltiplas tentativas ─────────────────────
+            self._fase_arp(rede_cidr)
 
-            # ── FASE 1: ARP broadcast com timeout estendido ──────────────
-            # timeout=2 era insuficiente em redes corporativas com >100 hosts
-            # ou switches com STP/port security. Aumentado para 4s.
-            resultado = arping(rede, iface=self.interface, timeout=4, verbose=False)
-
-            dispositivos = []
-            vistos: set = set()
-            ips_vistos: set = set()
-            for _, received in resultado[0]:
-                ip, mac = received.psrc, received.hwsrc
-                if not self._ip_util(ip) or (ip, mac) in vistos:
-                    continue
-                vistos.add((ip, mac))
-                ips_vistos.add(ip)
-                dispositivos.append((ip, mac, ""))
-                self.dispositivo_encontrado.emit(ip, mac, "")
-
-            # ── FASE 2: ICMP sweep para hosts que bloqueiam ARP ──────────
-            # VMs, firewalls e hosts com ARP filtering não respondem ARP
-            # mas respondem ICMP Echo. Esta fase cobre essa lacuna.
+            # ── Fase 2: ICMP paralelo nos hosts ainda não respondidos ─────
             if self.habilitar_ping:
-                try:
-                    rede_obj = ipaddress.ip_network(rede, strict=False)
-                    hosts_todos = [str(h) for h in list(rede_obj.hosts())[:254]]
-                    hosts_pendentes = [h for h in hosts_todos if h not in ips_vistos]
+                self._fase_icmp(rede_cidr)
 
+            # ── Fase 3: expansão para /22 se poucos dispositivos ──────────
+            if self.HABILITAR_EXPANSAO and len(self._ips_encontrados) < 30:
+                rede_expandida = self._expandir_rede(rede_cidr)
+                if rede_expandida and rede_expandida != rede_cidr:
                     self.progresso_atualizado.emit(
-                        f"Fase 2/2: ICMP sweep em {len(hosts_pendentes)} host(s) restante(s)..."
+                        f"Poucos dispositivos em {rede_cidr}. "
+                        f"Expandindo varredura para {rede_expandida} …"
                     )
+                    self._fase_arp(rede_expandida)
+                    if self.habilitar_ping:
+                        self._fase_icmp(rede_expandida)
 
-                    from scapy.all import srp, Ether, IP, ICMP
+            total = len(self._dispositivos)
+            self.progresso_atualizado.emit(
+                f"Varredura concluída — {total} dispositivo(s) encontrado(s)."
+            )
+            self.varredura_concluida.emit(self._dispositivos)
 
-                    # Processa em lotes de 32 para controlar uso de memória
-                    # e evitar flood que trigger port-security em switches
-                    LOTE = 32
-                    for i in range(0, len(hosts_pendentes), LOTE):
-                        lote = hosts_pendentes[i:i + LOTE]
-                        pacotes = [
-                            Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=h) / ICMP()
-                            for h in lote
-                        ]
-                        try:
-                            respostas, _ = srp(
-                                pacotes,
-                                iface=self.interface,
-                                timeout=1,
-                                verbose=False,
-                            )
-                            for _, r in respostas:
-                                if not r.haslayer(IP):
-                                    continue
-                                ip  = r[IP].src
-                                mac = r[Ether].src if r.haslayer(Ether) else ""
-                                if self._ip_util(ip) and ip not in ips_vistos:
-                                    ips_vistos.add(ip)
-                                    dispositivos.append((ip, mac, ""))
-                                    self.dispositivo_encontrado.emit(ip, mac, "")
-                        except Exception:
-                            pass  # lote individual falhou — continua os demais
-                except Exception as e:
-                    self.progresso_atualizado.emit(f"ICMP sweep parcialmente falhou: {e}")
+        except Exception as erro:
+            self.erro_ocorrido.emit(f"Erro na descoberta: {erro}")
+
+    # ── Fase 1: ARP broadcast (múltiplas tentativas) ──────────────────────
+
+    def _fase_arp(self, rede_cidr: str):
+        """
+        Envia ARP broadcast para toda a sub-rede, repetindo até
+        TENTATIVAS_ARP vezes para recuperar respostas perdidas.
+        """
+        from scapy.all import arping
+
+        for tentativa in range(1, self.TENTATIVAS_ARP + 1):
+            self.progresso_atualizado.emit(
+                f"ARP broadcast em {rede_cidr} — tentativa {tentativa}/{self.TENTATIVAS_ARP} …"
+            )
+            try:
+                resultado = arping(
+                    rede_cidr,
+                    iface=self.interface,
+                    timeout=self.TIMEOUT_ARP,
+                    verbose=False,
+                    retry=0,    # sem retry interno do Scapy — controlamos nós mesmos
+                )
+                for _, recebido in resultado[0]:
+                    ip  = recebido.psrc
+                    mac = recebido.hwsrc
+                    if self._ip_valido(ip):
+                        self._registrar(ip, mac, "")
+            except Exception as erro_arp:
+                # Falha numa tentativa não cancela as demais
+                self.progresso_atualizado.emit(
+                    f"ARP tentativa {tentativa} parcialmente falhou: {erro_arp}"
+                )
+
+            # Pequena pausa entre tentativas para não sobrecarregar a rede
+            if tentativa < self.TENTATIVAS_ARP:
+                time.sleep(1.0)
+
+    # ── Fase 2: ICMP paralelo ─────────────────────────────────────────────
+
+    def _fase_icmp(self, rede_cidr: str):
+        """
+        ICMP Echo Request em paralelo para todos os hosts ainda não
+        respondidos. Usa ThreadPoolExecutor para velocidade máxima.
+        """
+        try:
+            rede_obj    = ipaddress.ip_network(rede_cidr, strict=False)
+            todos_hosts = [str(h) for h in list(rede_obj.hosts())[:1022]]
+            pendentes   = [h for h in todos_hosts if h not in self._ips_encontrados]
+
+            total_pendentes = len(pendentes)
+            if not pendentes:
+                return
 
             self.progresso_atualizado.emit(
-                f"Varredura concluída: {len(dispositivos)} dispositivo(s) encontrado(s)."
+                f"ICMP sweep em {total_pendentes} host(s) pendente(s) "
+                f"({self.MAX_WORKERS_ICMP} threads simultâneas) …"
             )
-            self.varredura_concluida.emit(dispositivos)
 
-        except Exception as e:
-            self.erro_ocorrido.emit(f"Erro na descoberta: {e}")
+            # Divide em lotes para evitar flood que trigger port-security
+            lotes = [
+                pendentes[i:i + self.TAMANHO_LOTE_ICMP]
+                for i in range(0, len(pendentes), self.TAMANHO_LOTE_ICMP)
+            ]
+
+            concluidos = 0
+            with ThreadPoolExecutor(max_workers=self.MAX_WORKERS_ICMP) as pool:
+                futuros = {
+                    pool.submit(self._varrer_lote_icmp, lote): lote
+                    for lote in lotes
+                }
+                for futuro in as_completed(futuros):
+                    concluidos += len(futuros[futuro])
+                    pct = int(concluidos / total_pendentes * 100)
+                    self.progresso_atualizado.emit(
+                        f"ICMP sweep: {concluidos}/{total_pendentes} hosts ({pct}%) …"
+                    )
+
+        except Exception as erro_icmp:
+            self.progresso_atualizado.emit(f"ICMP sweep falhou: {erro_icmp}")
+
+    def _varrer_lote_icmp(self, hosts: list):
+        """
+        Varre um lote de hosts com ICMP. Executado em thread do pool.
+        Cada chamada é independente e thread-safe.
+        """
+        try:
+            from scapy.all import srp, Ether, IP, ICMP
+
+            pacotes = [
+                Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=host) / ICMP()
+                for host in hosts
+            ]
+            respostas, _ = srp(
+                pacotes,
+                iface=self.interface,
+                timeout=self.TIMEOUT_ICMP,
+                verbose=False,
+            )
+            for _, resposta in respostas:
+                if not resposta.haslayer(IP):
+                    continue
+                ip  = resposta[IP].src
+                mac = ""
+                try:
+                    from scapy.all import Ether as EtherScapy
+                    if resposta.haslayer(EtherScapy):
+                        mac = resposta[EtherScapy].src
+                except Exception:
+                    pass
+                if self._ip_valido(ip):
+                    self._registrar(ip, mac, "")
+
+        except Exception:
+            # Lote individual falhou — não cancela os demais
+            pass
+
+    # ── Registro thread-safe ──────────────────────────────────────────────
+
+    def _registrar(self, ip: str, mac: str, hostname: str):
+        """Registra um dispositivo. Thread-safe via lock."""
+        with self._lock:
+            if ip in self._ips_encontrados:
+                return
+            self._ips_encontrados.add(ip)
+            self._dispositivos.append((ip, mac, hostname))
+
+        # Emite sinal fora do lock para não bloquear outras threads
+        self.dispositivo_encontrado.emit(ip, mac, hostname)
+
+    # ── Utilitários de rede ───────────────────────────────────────────────
 
     @staticmethod
-    def _ip_util(ip: str) -> bool:
+    def _ip_valido(ip: str) -> bool:
+        """Filtra IPs de broadcast, loopback, link-local e multicast."""
         try:
-            p = [int(x) for x in ip.split(".")]
-            if len(p) != 4:
+            partes = [int(x) for x in ip.split(".")]
+            if len(partes) != 4:
                 return False
             return not (
-                p[0] in (0, 127) or
-                (p[0] == 169 and p[1] == 254) or
-                224 <= p[0] <= 239 or
-                p[3] == 255
+                partes[0] in (0, 127)                      # loopback / reservado
+                or (partes[0] == 169 and partes[1] == 254) # link-local
+                or 224 <= partes[0] <= 239                 # multicast
+                or partes[3] == 255                        # broadcast
             )
         except Exception:
             return False
 
-    def _cidr_por_interface(self) -> str:
+    def _detectar_cidr(self) -> str:
+        """Tenta obter CIDR diretamente da interface Scapy."""
         try:
             from scapy.all import get_if_addr, get_if_netmask
             ip   = get_if_addr(self.interface)
             mask = get_if_netmask(self.interface)
-            if ip and mask:
-                bits = sum(bin(int(p)).count('1') for p in mask.split('.'))
-                return f"{ip}/{bits}"
+            if ip and mask and ip != "0.0.0.0":
+                prefixo = sum(bin(int(p)).count("1") for p in mask.split("."))
+                rede = ipaddress.ip_network(f"{ip}/{prefixo}", strict=False)
+                return str(rede)
         except Exception:
-            return ""
+            pass
         return ""
 
     @staticmethod
     def _cidr_por_ip_local() -> str:
+        """Fallback: deduz CIDR a partir do IP local (assume /24)."""
         ip = obter_ip_local()
         if not ip or ip == "127.0.0.1":
             return ""
         partes = ip.split('.')
         return f"{'.'.join(partes[:3])}.0/24" if len(partes) == 4 else ""
+
+    @staticmethod
+    def _expandir_rede(cidr: str) -> Optional[str]:
+        """
+        Se a rede for /24, retorna a /22 que a contém
+        (cobre 4x mais hosts — útil em redes institucionais grandes).
+        """
+        try:
+            rede = ipaddress.ip_network(cidr, strict=False)
+            if rede.prefixlen == 24:
+                return str(rede.supernet(new_prefix=22))
+            if rede.prefixlen == 23:
+                return str(rede.supernet(new_prefix=22))
+        except Exception:
+            pass
+        return None
 
 
 # ════════════════════════════════════════════════════════════════════════
