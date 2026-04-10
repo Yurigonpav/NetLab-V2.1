@@ -232,6 +232,13 @@ class VisualizadorTopologia(QWidget):
         # e economiza ~60% do CPU gasto em redraws desnecessários.
         timer.start(100)
 
+        # Debounce do recalculo de layout — chama no máximo 1x a cada 800ms,
+        # independentemente de quantos novos IPs chegarem nesse intervalo.
+        self._timer_layout = QTimer(self)
+        self._timer_layout.setSingleShot(True)
+        self._timer_layout.setInterval(800)
+        self._timer_layout.timeout.connect(self._recalcular_layout)
+
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.setMinimumSize(500, 350)
@@ -251,7 +258,10 @@ class VisualizadorTopologia(QWidget):
                 "pacotes":  0,
                 "portas":   set(),
             }
-            self._recalcular_layout()
+            # Agenda recalculo de layout com debounce — evita chamar
+            # _recalcular_layout centenas de vezes por segundo em capturas pesadas.
+            if not self._timer_layout.isActive():
+                self._timer_layout.start()
         else:
             if mac and chave != "internet":
                 self.dispositivos[chave]["mac"] = mac
